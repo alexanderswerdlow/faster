@@ -1,0 +1,12 @@
+__pycache__/
+wandb/
+archive/
+docs/
+.ruff_cache/
+exp/
+artifacts/
+datasets/robomimic/
+third_party/
+logs/
+scripts/plots/archive
+/plots/

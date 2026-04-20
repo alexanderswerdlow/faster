@@ -1,0 +1,76 @@
+[project]
+name = "expo"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "absl-py>=2.3.1",
+    "cython==0.29.34",
+    "distrax>=0.1.2",
+    "dm-control>=1.0.11",
+    "dm-env-wrappers>=0.0.13",
+    "easydict>=1.13",
+    "flax==0.10.6", # must be >=0.10.5
+    "gym==0.23.1",
+    "gymnasium==0.29.1",
+    "gymnasium-robotics==1.2.2",
+    "h5py>=3.14.0",
+    "imageio>=2.37.2",
+    "jax-jumpy==1.0.0",
+    "jax[cuda12-pip]==0.5.3", # Must be 0.5.x for pi0 checkpoint loading to work properly
+    "jupyter>=1.1.1",
+    "matplotlib>=3.9.4",
+    "mimicgen",
+    "ml-collections>=0.1.1",
+    "moviepy>=1.0.3",
+    "nvidia-cudnn-cu12>9.0",
+    "optax==0.1.5",
+    "orbax-checkpoint==0.5.23",
+    "robomimic",
+    "robosuite",
+    "scikit-learn>=1.6.1",
+    "scipy<1.13",
+    "seaborn>=0.13.2",
+    "submitit>=1.5.4",
+    "tensorboardx>=2.6.4",
+    "tensorflow-cpu==2.12.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tensorflow==2.12.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "tensorflow-estimator==2.12.0",
+    "tensorflow-probability==0.19.0",
+    "tqdm>=4.67.2",
+    "torch==2.7.1",
+    "wandb>=0.24.1",
+    "nvidia-cuda-nvcc-cu12<12.9",
+    "tyro>=1.0.6",
+    "augmax>=0.4.1",
+    "beartype==0.19.0",
+    "einops>=0.8.2",
+    "jaxtyping==0.2.36",
+    "sentencepiece>=0.2.1",
+    "safetensors>=0.7.0",
+    "tqdm-loggable>=0.3",
+    "numpydantic==1.6.9",
+    "numpy==1.26.4", # 1.24 breaks checkpoint loading
+    "tensorflow-datasets>=4.9.4",
+    "pyarrow==20.0.0",
+    "av==14.2.0",
+    "datasets==4.*",
+    "lerobot",
+]
+
+[tool.uv]
+override-dependencies = ["mujoco==2.3.2", "chex==0.1.86", "numpy==1.26.4"]
+environments = [
+    "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+]
+find-links = ["https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"]
+
+[tool.uv.sources]
+mimicgen = { git = "https://github.com/NVlabs/mimicgen.git" }
+robomimic = { git = "https://github.com/ARISE-Initiative/robomimic", rev = "dde3a6e74886e0768cedf18f8f9c813d47d31ebd" }
+robosuite = { git = "https://github.com/ARISE-Initiative/robosuite", rev = "de64fa5935f9f30ce01b36a3ef1a3242060b9cdb" }
+d4rl = { git = "https://github.com/Farama-Foundation/D4RL.git", rev = "2b96431a0e9fd90c8032624b0dc3cd4514d15632" }
+lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
+
+[tool.ruff]
+line-length = 260
