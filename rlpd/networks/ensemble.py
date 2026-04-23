@@ -1,9 +1,9 @@
 from typing import Type
 
-from flax.core.frozen_dict import FrozenDict
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from flax.core.frozen_dict import FrozenDict
 
 
 class Ensemble(nn.Module):
@@ -38,9 +38,7 @@ def subsample_ensemble(key: jax.random.PRNGKey, params, num_sample: int, num_qs:
         indx = jax.random.choice(key, a=all_indx, shape=(num_sample,), replace=False)
 
         if "Ensemble_0" in params:
-            ens_params = jax.tree_util.tree_map(
-                lambda param: param[indx], params["Ensemble_0"]
-            )
+            ens_params = jax.tree_util.tree_map(lambda param: param[indx], params["Ensemble_0"])
             params = _replace_ensemble_params(params, ens_params)
         else:
             params = jax.tree_util.tree_map(lambda param: param[indx], params)

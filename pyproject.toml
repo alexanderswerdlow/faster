@@ -17,7 +17,7 @@ dependencies = [
     "h5py>=3.14.0",
     "imageio>=2.37.2",
     "jax-jumpy==1.0.0",
-    "jax[cuda12-pip]==0.5.3", # Must be 0.5.x for pi0 checkpoint loading to work properly
+    "jax[cuda12-pip]==0.5.3",
     "jupyter>=1.1.1",
     "matplotlib>=3.9.4",
     "mimicgen",
@@ -39,7 +39,7 @@ dependencies = [
     "tensorflow-probability==0.19.0",
     "tqdm>=4.67.2",
     "torch==2.7.1",
-    "wandb>=0.24.1",
+    "wandb>=0.26.1",
     "nvidia-cuda-nvcc-cu12<12.9",
     "tyro>=1.0.6",
     "augmax>=0.4.1",
@@ -73,4 +73,13 @@ d4rl = { git = "https://github.com/Farama-Foundation/D4RL.git", rev = "2b96431a0
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 
 [tool.ruff]
-line-length = 260
+line-length = 140
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.format]
+skip-magic-trailing-comma = true
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false

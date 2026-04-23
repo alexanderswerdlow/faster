@@ -1,22 +1,15 @@
 from copy import deepcopy
 
 import numpy as np
-from robomimic.config import config_factory
 import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
+from robomimic.config import config_factory
 
 from rlpd.data.dataset import Dataset
 
-
 OBS_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos", "object")
-ENV_TO_HORIZON_MAP = {
-    "lift": 400,
-    "can": 400,
-    "square": 400,
-    "transport": 700,
-    "tool_hang": 700,
-}
+ENV_TO_HORIZON_MAP = {"lift": 400, "can": 400, "square": 400, "transport": 700, "tool_hang": 700}
 
 
 def _patch_robosuite_offscreen_context():
@@ -105,9 +98,7 @@ def process_robomimic_dataset(seq_dataset):
 
     for item in cached:
         observations.append(np.concatenate([item["obs"][key] for key in OBS_KEYS], axis=1))
-        next_observations.append(
-            np.concatenate([item["next_obs"][key] for key in OBS_KEYS], axis=1)
-        )
+        next_observations.append(np.concatenate([item["next_obs"][key] for key in OBS_KEYS], axis=1))
         actions.append(np.asarray(item["actions"]))
         rewards.append(np.asarray(item["rewards"]))
         terminals.append(np.asarray(item["dones"]))
@@ -126,21 +117,14 @@ def get_robomimic_env(dataset_path, example_action, env_name):
     _patch_robosuite_offscreen_context()
     ObsUtils.initialize_obs_utils_with_config(config_factory(algo_name="iql"))
     env_meta = _load_robomimic_env_meta(dataset_path)
-    env = EnvUtils.create_env_from_metadata(
-        env_meta=env_meta,
-        render=False,
-        render_offscreen=False,
-        use_image_obs=False,
-    )
+    env = EnvUtils.create_env_from_metadata(env_meta=env_meta, render=False, render_offscreen=False, use_image_obs=False)
     return RobosuiteGymWrapper(env, ENV_TO_HORIZON_MAP[env_name], example_action)
 
 
 def _episode_dones(observations, next_observations, terminals, ignore_done):
     dones = np.zeros_like(terminals, dtype=np.float32)
     for i in range(len(dones) - 1):
-        transition_break = (
-            np.linalg.norm(observations[i + 1] - next_observations[i]) > 1e-6
-        )
+        transition_break = np.linalg.norm(observations[i + 1] - next_observations[i]) > 1e-6
         if ignore_done:
             dones[i] = float(transition_break)
         else:
@@ -162,29 +146,14 @@ def _truncate_dataset_by_episodes(dataset_dict, num_data):
 
 
 class RoboD4RLDataset(Dataset):
-    def __init__(
-        self,
-        env,
-        clip_to_eps=True,
-        eps=1e-5,
-        num_data=0,
-        ignore_done=False,
-        custom_dataset=None,
-    ):
-        assert custom_dataset is not None, (
-            "Public release RoboD4RLDataset only supports custom_dataset input."
-        )
+    def __init__(self, env, clip_to_eps=True, eps=1e-5, num_data=0, ignore_done=False, custom_dataset=None):
+        assert custom_dataset is not None, "Public release RoboD4RLDataset only supports custom_dataset input."
         dataset = {key: np.asarray(value).copy() for key, value in custom_dataset.items()}
         if clip_to_eps:
             lim = 1 - eps
             dataset["actions"] = np.clip(dataset["actions"], -lim, lim)
 
-        dones = _episode_dones(
-            dataset["observations"],
-            dataset["next_observations"],
-            dataset["terminals"],
-            ignore_done,
-        )
+        dones = _episode_dones(dataset["observations"], dataset["next_observations"], dataset["terminals"], ignore_done)
         dataset_dict = {
             "observations": dataset["observations"].astype(np.float32),
             "actions": dataset["actions"].astype(np.float32),

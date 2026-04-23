@@ -1,5 +1,3 @@
-from functools import partial
-from random import sample
 from typing import Dict, Iterable, Optional, Tuple, Union
 
 import jax
@@ -39,9 +37,7 @@ def _subselect(dataset_dict: DatasetDict, index: np.ndarray) -> DatasetDict:
     return new_dataset_dict
 
 
-def _sample(
-    dataset_dict: Union[np.ndarray, DatasetDict], indx: np.ndarray
-) -> DatasetDict:
+def _sample(dataset_dict: Union[np.ndarray, DatasetDict], indx: np.ndarray) -> DatasetDict:
     if isinstance(dataset_dict, np.ndarray):
         return dataset_dict[indx]
     elif isinstance(dataset_dict, dict):
@@ -78,12 +74,7 @@ class Dataset(object):
     def __len__(self) -> int:
         return self.dataset_len
 
-    def sample(
-        self,
-        batch_size: int,
-        keys: Optional[Iterable[str]] = None,
-        indx: Optional[np.ndarray] = None,
-    ) -> frozen_dict.FrozenDict:
+    def sample(self, batch_size: int, keys: Optional[Iterable[str]] = None, indx: Optional[np.ndarray] = None) -> frozen_dict.FrozenDict:
         if indx is None:
             if hasattr(self.np_random, "integers"):
                 indx = self.np_random.integers(len(self), size=batch_size)
@@ -116,12 +107,8 @@ class Dataset(object):
             @jax.jit
             def _sample_jax(rng):
                 key, rng = jax.random.split(rng)
-                indx = jax.random.randint(
-                    key, (batch_size,), minval=0, maxval=len(self)
-                )
-                return rng, jax.tree_map(
-                    lambda d: jnp.take(d, indx, axis=0), jax_dataset_dict
-                )
+                indx = jax.random.randint(key, (batch_size,), minval=0, maxval=len(self))
+                return rng, jax.tree_map(lambda d: jnp.take(d, indx, axis=0), jax_dataset_dict)
 
             self._sample_jax = _sample_jax
 
@@ -161,18 +148,10 @@ class Dataset(object):
 
         return episode_starts, episode_ends, episode_returns
 
-    def filter(
-        self, take_top: Optional[float] = None, threshold: Optional[float] = None
-    ):
-        assert (take_top is None and threshold is not None) or (
-            take_top is not None and threshold is None
-        )
+    def filter(self, take_top: Optional[float] = None, threshold: Optional[float] = None):
+        assert (take_top is None and threshold is not None) or (take_top is not None and threshold is None)
 
-        (
-            episode_starts,
-            episode_ends,
-            episode_returns,
-        ) = self._trajectory_boundaries_and_returns()
+        (episode_starts, episode_ends, episode_returns) = self._trajectory_boundaries_and_returns()
 
         if take_top is not None:
             threshold = np.percentile(episode_returns, 100 - take_top)
@@ -189,7 +168,5 @@ class Dataset(object):
 
     def normalize_returns(self, scaling: float = 1000):
         (_, _, episode_returns) = self._trajectory_boundaries_and_returns()
-        self.dataset_dict["rewards"] /= np.max(episode_returns) - np.min(
-            episode_returns
-        )
+        self.dataset_dict["rewards"] /= np.max(episode_returns) - np.min(episode_returns)
         self.dataset_dict["rewards"] *= scaling

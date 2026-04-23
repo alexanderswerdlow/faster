@@ -105,13 +105,7 @@ def _critic_summary(params, *, max_items=8):
     other = total - sum(v for _, v in kept)
     if other > 0:
         kept = [*kept, ("other", other)]
-    return {
-        "total": total,
-        "backbone": backbone,
-        "head": head,
-        "ensemble_size": ensemble_size,
-        "by_module": kept,
-    }
+    return {"total": total, "backbone": backbone, "head": head, "ensemble_size": ensemble_size, "by_module": kept}
 
 
 def _generic_summary(params, *, max_items=8):
@@ -121,19 +115,12 @@ def _generic_summary(params, *, max_items=8):
     other = total - sum(v for _, v in kept)
     if other > 0:
         kept = [*kept, ("other", other)]
-    return {
-        "total": total,
-        "by_module": kept,
-    }
+    return {"total": total, "by_module": kept}
 
 
 def _summary_params_for_state(agent, field_name, state):
     params = state.params
-    actor_name = {
-        "actor_train_state": "actor",
-        "edit_actor_train_state": "edit_actor",
-        "pi05_train_state": "pi05_actor",
-    }.get(field_name)
+    actor_name = {"actor_train_state": "actor", "edit_actor_train_state": "edit_actor", "pi05_train_state": "pi05_actor"}.get(field_name)
     if actor_name is None or not hasattr(params, "filter"):
         return params
     actor = getattr(agent, actor_name, None)

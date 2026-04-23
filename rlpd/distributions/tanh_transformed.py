@@ -1,7 +1,6 @@
-import tensorflow_probability
-
 import jax
 import jax.numpy as jnp
+import tensorflow_probability
 
 tfp = tensorflow_probability.substrates.jax
 tfd = tfp.distributions
@@ -10,11 +9,7 @@ tfb = tfp.bijectors
 
 class TanhTransformedDistribution(tfd.TransformedDistribution):
     def __init__(self, distribution, validate_args=False):
-        super().__init__(
-            distribution=distribution,
-            bijector=tfb.Tanh(),
-            validate_args=validate_args,
-        )
+        super().__init__(distribution=distribution, bijector=tfb.Tanh(), validate_args=validate_args)
 
     def mode(self) -> jnp.ndarray:
         return self.bijector.forward(self.distribution.mode())
@@ -26,10 +21,7 @@ class TanhTransformedDistribution(tfd.TransformedDistribution):
         pre_tanh = jnp.arctanh(clipped)
         scale_diag = self.distribution.scale.diag
         centered = (pre_tanh - self.distribution.loc) / scale_diag
-        base_log_prob = jnp.sum(
-            -0.5 * jnp.square(centered) - jnp.log(scale_diag) - 0.5 * jnp.log(2.0 * jnp.pi),
-            axis=-1,
-        )
+        base_log_prob = jnp.sum(-0.5 * jnp.square(centered) - jnp.log(scale_diag) - 0.5 * jnp.log(2.0 * jnp.pi), axis=-1)
         log_det = 2.0 * (jnp.log(2.0) - pre_tanh - jax.nn.softplus(-2.0 * pre_tanh))
         return base_log_prob - jnp.sum(log_det, axis=-1)
 

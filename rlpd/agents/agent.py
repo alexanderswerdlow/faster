@@ -1,7 +1,6 @@
 from functools import partial
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import struct
 from flax.training.train_state import TrainState
@@ -31,7 +30,5 @@ class Agent(struct.PyTreeNode):
         return np.asarray(actions)
 
     def sample_actions(self, observations: np.ndarray) -> np.ndarray:
-        actions, new_rng = _sample_actions(
-            self.rng, self.actor.apply_fn, self.actor.params, observations
-        )
+        actions, new_rng = _sample_actions(self.rng, self.actor.apply_fn, self.actor.params, observations)
         return np.asarray(actions), self.replace(rng=new_rng)

@@ -1,29 +1,33 @@
 from functools import partial
-from typing import Dict, Optional, Sequence
+from typing import Optional, Sequence
 
 import flax
 import flax.linen as nn
-from flax import struct
-from flax.training.train_state import TrainState
 import gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax import struct
+from flax.training.train_state import TrainState
 from ml_collections import config_dict
 
 from rlpd.agents.agent import Agent
 from rlpd.agents.sac.temperature import Temperature
 from rlpd.data.dataset import DatasetDict
 from rlpd.distributions import TanhNormal
-from rlpd.networks import Ensemble, MLP, MLPResNetV2, StateActionValue, subsample_ensemble
 from rlpd.networks import (
     DDPM,
+    MLP,
     DiffusionMLP,
     DiffusionMLPResNet,
+    Ensemble,
     FourierFeatures,
+    MLPResNetV2,
+    StateActionValue,
     cosine_beta_schedule,
     ddim_sampler,
+    subsample_ensemble,
     vp_beta_schedule,
 )
 
@@ -56,17 +60,10 @@ def _sample_actions_jit(agent, observations):
 
     actor_params = agent.target_actor.params
     if agent.filter_enabled and agent.filter_at_eval:
-        actions, _, rng = agent._sample_candidates(
-            rng,
-            observations,
-            agent.N,
-            actor_params,
-            agent.filter_temperature_backup_init,
-        )
+        actions, _, rng = agent._sample_candidates(rng, observations, agent.N, actor_params, agent.filter_temperature_train)
     else:
         observations_repeated = jnp.broadcast_to(
-            observations[:, None, :],
-            (observations.shape[0], agent.N, observations.shape[-1]),
+            observations[:, None, :], (observations.shape[0], agent.N, observations.shape[-1])
         ).reshape(-1, observations.shape[-1])
         actions, rng = ddim_sampler(
             agent.actor.apply_fn,
@@ -78,10 +75,8 @@ def _sample_actions_jit(agent, observations):
             agent.alphas,
             agent.alpha_hats,
             agent.betas,
-            agent.ddpm_temperature,
             agent.M,
-            agent.clip_sampler,
-            eta=agent._current_ddim_eta(),
+            eta=agent.ddim_eta,
         )
         actions = actions.reshape(1, agent.N, -1)
 
@@ -91,18 +86,16 @@ def _sample_actions_jit(agent, observations):
         key, rng = jax.random.split(rng)
         target_params = subsample_ensemble(key, agent.target_critic.params, agent.num_min_qs, agent.num_qs)
         obs_rep = jnp.broadcast_to(
-            observations[:, None, :],
-            (observations.shape[0], diffusion_actions.shape[0], observations.shape[-1]),
+            observations[:, None, :], (observations.shape[0], diffusion_actions.shape[0], observations.shape[-1])
         ).reshape(-1, observations.shape[-1])
         all_actions = diffusion_actions
 
         if agent.ne_samples > 0:
             key, rng = jax.random.split(rng)
             d_actions = diffusion_actions[: agent.ne_samples]
-            r_obs = jnp.broadcast_to(
-                observations[:, None, :],
-                (observations.shape[0], agent.ne_samples, observations.shape[-1]),
-            ).reshape(-1, observations.shape[-1])
+            r_obs = jnp.broadcast_to(observations[:, None, :], (observations.shape[0], agent.ne_samples, observations.shape[-1])).reshape(
+                -1, observations.shape[-1]
+            )
             r_in = jnp.concatenate([r_obs, d_actions], axis=1)
             r_samples, rng = _sample_actions(key, agent.edit_actor.apply_fn, agent.edit_actor.params, r_in)
             r_samples = agent._apply_residual_action_mask(r_samples * agent.r_action_scale) + d_actions
@@ -110,12 +103,7 @@ def _sample_actions_jit(agent, observations):
             obs_rep = jnp.concatenate([obs_rep, r_obs], axis=0)
             all_actions = jnp.concatenate([all_actions, r_samples], axis=0)
 
-        qs = compute_q(
-            agent.target_critic.apply_fn,
-            target_params,
-            obs_rep,
-            all_actions,
-        )
+        qs = compute_q(agent.target_critic.apply_fn, target_params, obs_rep, all_actions)
         idx = jnp.argmax(qs)
         action = all_actions[idx]
     else:
@@ -125,18 +113,12 @@ def _sample_actions_jit(agent, observations):
     return action, rng
 
 
-_ALLOWED_SAMPLING_MODES = ("zscore", "plain", "top_nsigma", "min_p", "mirostat")
+_ALLOWED_SAMPLING_MODES = ("zscore", "plain")
 
 
 def _validate_sampling_mode(mode: str) -> None:
     if mode not in _ALLOWED_SAMPLING_MODES:
         raise ValueError(f"Invalid sampling_mode={mode}. Allowed: {_ALLOWED_SAMPLING_MODES}")
-
-
-def _entropy_from_logits(logits: jnp.ndarray) -> jnp.ndarray:
-    logp = jax.nn.log_softmax(logits, axis=-1)
-    p = jnp.exp(logp)
-    return -(p * logp).sum(axis=-1)
 
 
 def _z_score_normalize(values: jnp.ndarray, axis: int, eps: float = 1e-6) -> jnp.ndarray:
@@ -152,18 +134,8 @@ def _gumbel_topk(key, logits, k):
     return idx
 
 
-def sample_k_indices(
-    key,
-    scores: jnp.ndarray,
-    k: int,
-    *,
-    temperature: Optional[jnp.ndarray] = None,
-    logit_scale: Optional[jnp.ndarray] = None,
-    mode: str = "zscore",
-) -> jnp.ndarray:
+def sample_k_indices(key, scores: jnp.ndarray, k: int, *, temperature: jnp.ndarray, mode: str = "zscore") -> jnp.ndarray:
     _validate_sampling_mode(mode)
-    if (temperature is None) == (logit_scale is None):
-        raise ValueError("Specify exactly one of temperature or logit_scale.")
     k = int(k)
     if k < 1:
         raise ValueError(f"k must be >= 1; got k={k}")
@@ -182,73 +154,11 @@ def sample_k_indices(
 
     proc = s2 if mode == "plain" else _z_score_normalize(s2, axis=1)
 
-    nsigma = 1.0
-    p_min = 0.05
-
-    def with_mask(mask: Optional[jnp.ndarray], logits: jnp.ndarray) -> jnp.ndarray:
-        if mask is None:
-            return logits
-        mask = jnp.asarray(mask, dtype=bool)
-        kept = mask.sum(axis=1)
-        need = kept < k
-        topk = jax.lax.top_k(s2, k)[1]
-        topk_mask = jnp.zeros_like(mask)
-        topk_mask = topk_mask.at[jnp.arange(batch)[:, None], topk].set(True)
-        mask = jnp.where(need[:, None], mask | topk_mask, mask)
-        neg_inf = jnp.asarray(-jnp.inf, dtype=logits.dtype)
-        return jnp.where(mask, logits, neg_inf)
-
-    if mode == "mirostat":
-        if temperature is None:
-            raise ValueError("mirostat mode requires temperature to be specified (interpreted as target perplexity).")
-
-        target_perplexity = jnp.asarray(temperature, dtype=proc.dtype)
-        target_perplexity = jnp.maximum(target_perplexity, jnp.asarray(1.0, dtype=proc.dtype))
-        target_entropy = jnp.log(target_perplexity)
-        max_entropy = jnp.log(jnp.asarray(n, dtype=proc.dtype))
-        target_entropy = jnp.clip(target_entropy, 0.0, max_entropy)
-        target_entropy = jnp.broadcast_to(target_entropy, (batch,))
-
-        t_lo = jnp.full((batch,), 1e-4, dtype=proc.dtype)
-        t_hi = jnp.full((batch,), 1e4, dtype=proc.dtype)
-
-        def body(_, state):
-            lo, hi = state
-            mid = jnp.sqrt(lo * hi)
-            h = _entropy_from_logits(proc / mid[:, None])
-            too_low = h < target_entropy
-            lo = jnp.where(too_low, mid, lo)
-            hi = jnp.where(too_low, hi, mid)
-            return lo, hi
-
-        lo, hi = jax.lax.fori_loop(0, 16, body, (t_lo, t_hi))
-        t_star = jnp.sqrt(lo * hi)
-
-        logits = proc / t_star[:, None]
-        idx = _gumbel_topk(key, logits, k)
-        return idx.reshape(prefix + (k,))
-
-    if logit_scale is not None:
-        scale = jnp.asarray(logit_scale, dtype=proc.dtype)
-        logits = proc * scale
-        if mode == "top_nsigma":
-            logits = with_mask(proc >= nsigma, logits)
-        elif mode == "min_p":
-            probs = jax.nn.softmax(logits, axis=1)
-            logits = with_mask(probs >= p_min, logits)
-        idx = _gumbel_topk(key, logits, k)
-        return idx.reshape(prefix + (k,))
-
     temp = jnp.asarray(temperature, dtype=proc.dtype)
     temp = jnp.broadcast_to(temp, (batch,))
     do_sample = temp > 0
     temp_safe = jnp.where(do_sample, temp, jnp.asarray(1.0, dtype=proc.dtype))
     logits = proc / temp_safe[:, None]
-    if mode == "top_nsigma":
-        logits = with_mask(proc >= nsigma, logits)
-    elif mode == "min_p":
-        probs = jax.nn.softmax(logits, axis=1)
-        logits = with_mask(probs >= p_min, logits)
 
     idx_sample = _gumbel_topk(key, logits, k)
     idx_det = jax.lax.top_k(s2, k)[1]
@@ -283,20 +193,8 @@ class DenoisingStateActionValue(nn.Module):
         return jnp.squeeze(value, -1)
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        "actor_apply_fn",
-        "hidden_apply_fn",
-        "act_dim",
-        "T",
-        "N",
-        "clip_sampler",
-        "training",
-        "filter_temperature_mode",
-    ),
-)
-def ddpm_sampler_hidden_filter(
+@partial(jax.jit, static_argnames=("actor_apply_fn", "hidden_apply_fn", "act_dim", "T", "N", "training", "filter_temperature_mode"))
+def ddim_sampler_hidden_filter(
     actor_apply_fn,
     actor_params,
     hidden_apply_fn,
@@ -309,9 +207,7 @@ def ddpm_sampler_hidden_filter(
     alphas,
     alpha_hats,
     betas,
-    sample_temperature,
     repeat_last_step,
-    clip_sampler,
     filter_temperature: float = 0.0,
     filter_temperature_mode: str = "plain",
     ddim_eta: float = 0.0,
@@ -336,12 +232,7 @@ def ddpm_sampler_hidden_filter(
             sqrt_alpha_hat_t = jnp.sqrt(alpha_hat_t)
             sqrt_one_minus_alpha_hat_t = jnp.sqrt(1.0 - alpha_hat_t)
             x0_pred = (x_flat - sqrt_one_minus_alpha_hat_t * eps_pred) / sqrt_alpha_hat_t
-            alpha_hat_prev = jax.lax.cond(
-                t_ > 0,
-                lambda t: alpha_hats[t - 1],
-                lambda _: jnp.asarray(1.0, dtype=alpha_hat_t.dtype),
-                t_,
-            )
+            alpha_hat_prev = jax.lax.cond(t_ > 0, lambda t: alpha_hats[t - 1], lambda _: jnp.asarray(1.0, dtype=alpha_hat_t.dtype), t_)
             eta = jnp.asarray(ddim_eta, dtype=x_flat.dtype)
 
             def deterministic(_):
@@ -351,7 +242,7 @@ def ddpm_sampler_hidden_filter(
             def stochastic(_):
                 sigma = eta * jnp.sqrt((1.0 - alpha_hat_prev) / (1.0 - alpha_hat_t) * (1.0 - alpha_hat_t / alpha_hat_prev))
                 z = jax.random.normal(jax.random.fold_in(noise_key, t_), x_flat.shape)
-                noise = sigma * sample_temperature * z
+                noise = sigma * z
                 eps_scale = jnp.sqrt(jnp.maximum(0.0, 1.0 - alpha_hat_prev - sigma**2))
                 x_next = jnp.sqrt(alpha_hat_prev) * x0_pred + eps_scale * eps_pred + noise
                 return x_next, x0_pred
@@ -359,9 +250,8 @@ def ddpm_sampler_hidden_filter(
             return jax.lax.cond(eta == 0.0, deterministic, stochastic, operand=None)
 
         x_next, x_eval = ddim_step(None)
-        if clip_sampler:
-            x_next = jnp.clip(x_next, -1, 1)
-            x_eval = jnp.clip(x_eval, -1, 1)
+        x_next = jnp.clip(x_next, -1, 1)
+        x_eval = jnp.clip(x_eval, -1, 1)
         return x_next.reshape(x_.shape), x_eval.reshape(x_.shape)
 
     def denoise_segment(x_, obs_, t_start, t_stop_exclusive):
@@ -423,11 +313,10 @@ class BetterDiffusionSACLearner(Agent):
     target_filter_critic: Optional[TrainState]
     filter_enabled: bool = struct.field(pytree_node=False)
     filter_at_eval: bool = struct.field(pytree_node=False)
-    filter_temperature_backup_init: float = struct.field(pytree_node=False)
-    filter_temperature_eval_sampling_init: float = struct.field(pytree_node=False)
+    filter_temperature_train: float = struct.field(pytree_node=False)
+    filter_temperature_eval: float = struct.field(pytree_node=False)
     filter_temperature_mode: str = struct.field(pytree_node=False)
 
-    clip_sampler: bool = struct.field(pytree_node=False)
     action_dim: int = struct.field(pytree_node=False)
     T: int = struct.field(pytree_node=False)
     N: int = struct.field(pytree_node=False)
@@ -436,29 +325,17 @@ class BetterDiffusionSACLearner(Agent):
     ne_samples_train: int = struct.field(pytree_node=False)
     r_action_scale: float = struct.field(pytree_node=False)
     residual_action_mask: Optional[np.ndarray] = struct.field(pytree_node=False)
-    batch_split: int = struct.field(pytree_node=False)
     M: int = struct.field(pytree_node=False)
-    ddpm_temperature: float
-    ddim_eta_final: float = struct.field(pytree_node=False)
-    ddim_eta_hold_steps: int = struct.field(pytree_node=False)
-    ddim_eta_anneal_steps: int = struct.field(pytree_node=False)
+    ddim_eta: float = struct.field(pytree_node=False)
     actor_tau: float
     tau: float
     discount: float
     target_entropy: float
 
-    # Train Settings
-    action_backup_soft: bool = struct.field(pytree_node=False)
-
-    # Sample Settings
-    filter_critic_count: int = struct.field(pytree_node=False)
-
     num_qs: int = struct.field(pytree_node=False)
     num_min_qs: Optional[int] = struct.field(pytree_node=False)
     filter_num_min_qs: Optional[int] = struct.field(pytree_node=False)
-    update_step: jnp.ndarray
 
-    # TODO: Make sure to update `configs/sar_better_config.py` when adding new fields to this function.
     @classmethod
     def create(
         cls,
@@ -468,7 +345,6 @@ class BetterDiffusionSACLearner(Agent):
         actor_lr: float = 3e-4,
         critic_lr: float = 3e-4,
         temp_lr: float = 3e-4,
-        action_backup_soft: bool = False,
         hidden_dims: Sequence[int] = (256, 256),
         critic_hidden_dims: Optional[Sequence[int]] = None,
         outer_critic_hidden_dims: Optional[Sequence[int]] = None,
@@ -481,6 +357,8 @@ class BetterDiffusionSACLearner(Agent):
         critic_dropout_rate: Optional[float] = None,
         critic_weight_decay: Optional[float] = None,
         critic_layer_norm: bool = False,
+        target_entropy: Optional[float] = None,
+        adjust_target_entropy: Optional[bool] = False,
         init_temperature: float = 1.0,
         use_pnorm: bool = False,
         use_critic_resnet: bool = False,
@@ -490,27 +368,21 @@ class BetterDiffusionSACLearner(Agent):
         T: int = 10,
         N: int = 32,
         train_N: int = 32,
-        batch_split: int = 1,
         M: int = 0,
         ne_samples: int = 0,
         ne_samples_train: int = 0,
         r_action_scale: float = 1.0,
         residual_action_mask: Optional[Sequence[float]] = None,
         actor_layer_norm: bool = True,
-        clip_sampler: bool = True,
         decay_steps: Optional[int] = int(3e6),
         actor_tau: float = 0.001,
         actor_num_blocks: int = 3,
-        ddpm_temperature: float = 1.0,
-        ddim_eta_final: float = 0.0,
-        ddim_eta_hold_steps: int = 0,
-        ddim_eta_anneal_steps: int = 0,
+        ddim_eta: float = 0.0,
         beta_schedule: str = "vp",
         filter_enabled: bool = False,
         filter_at_eval: bool = False,
-        filter_temperature_backup_init: Optional[float] = None,
-        filter_temperature_eval_sampling_init: Optional[float] = None,
-        filter_critic_count: int = 1,
+        filter_temperature_train: Optional[float] = None,
+        filter_temperature_eval: Optional[float] = None,
         filter_temperature_mode: str = "plain",
     ):
         action_dim = action_space.shape[-1]
@@ -519,12 +391,8 @@ class BetterDiffusionSACLearner(Agent):
             if residual_action_mask.shape != (action_dim,):
                 raise ValueError(f"Expected residual_action_mask shape ({action_dim},), got {residual_action_mask.shape}")
 
-        ddim_eta_final = float(ddim_eta_final)
-        ddim_eta_hold_steps = int(ddim_eta_hold_steps)
-        ddim_eta_anneal_steps = int(ddim_eta_anneal_steps)
-        assert ddim_eta_final >= 0.0
-        assert ddim_eta_hold_steps >= 0
-        assert ddim_eta_anneal_steps >= 0
+        ddim_eta = float(ddim_eta)
+        assert ddim_eta >= 0.0
 
         target_num_qs = num_min_qs if num_min_qs is not None else num_qs
         target_filter_num_qs = filter_num_min_qs if filter_num_min_qs is not None else num_qs
@@ -542,18 +410,17 @@ class BetterDiffusionSACLearner(Agent):
         critic_hidden_dims = hidden_dims if critic_hidden_dims is None else tuple(critic_hidden_dims)
         outer_critic_hidden_dims = critic_hidden_dims if outer_critic_hidden_dims is None else tuple(outer_critic_hidden_dims)
         filter_critic_hidden_dims = critic_hidden_dims if filter_critic_hidden_dims is None else tuple(filter_critic_hidden_dims)
-        target_entropy = -action_dim / 2
+        if target_entropy is None:
+            if adjust_target_entropy:
+                target_entropy = -action_dim / 2 + action_dim * jnp.log(r_action_scale)
+            else:
+                target_entropy = -action_dim / 2
 
         rng = jax.random.PRNGKey(seed)
         rng, actor_key, critic_key, temp_key = jax.random.split(rng, 4)
 
         preprocess_time_cls = partial(FourierFeatures, output_size=time_dim, learnable=True)
-        cond_model_cls = partial(
-            DiffusionMLP,
-            hidden_dims=(time_dim * 2, time_dim * 2),
-            activations=nn.swish,
-            activate_final=False,
-        )
+        cond_model_cls = partial(DiffusionMLP, hidden_dims=(time_dim * 2, time_dim * 2), activations=nn.swish, activate_final=False)
 
         if decay_steps is not None:
             actor_lr = optax.cosine_decay_schedule(actor_lr, decay_steps)
@@ -573,9 +440,7 @@ class BetterDiffusionSACLearner(Agent):
         actor_params = actor_def.init(actor_key, observations, actions, time)["params"]
         actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=optax.adamw(learning_rate=actor_lr))
         target_actor = TrainState.create(
-            apply_fn=actor_def.apply,
-            params=actor_params,
-            tx=optax.GradientTransformation(lambda _: None, lambda _: None),
+            apply_fn=actor_def.apply, params=actor_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
         )
 
         if beta_schedule == "cosine":
@@ -630,9 +495,7 @@ class BetterDiffusionSACLearner(Agent):
         critic = TrainState.create(apply_fn=critic_def.apply, params=critic_params, tx=tx)
         target_critic_def = Ensemble(outer_critic_cls, num=target_num_qs)
         target_critic = TrainState.create(
-            apply_fn=target_critic_def.apply,
-            params=critic_params,
-            tx=optax.GradientTransformation(lambda _: None, lambda _: None),
+            apply_fn=target_critic_def.apply, params=critic_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
         )
 
         temp_def = Temperature(init_temperature)
@@ -641,45 +504,27 @@ class BetterDiffusionSACLearner(Agent):
 
         filter_critic = None
         target_filter_critic = None
-        htemp_backup = 0.0
-        htemp_eval_sampling = 0.0
+        htemp_train = 0.0
+        htemp_eval = 0.0
 
         if filter_enabled:
-            assert train_N >= 1, train_N
+            assert train_N >= 1 and ne_samples_train <= 1
             if filter_at_eval:
-                assert N >= 1, N
-            if filter_at_eval:
-                assert ne_samples <= 1, ne_samples
-            assert ne_samples_train <= 1, ne_samples_train
-
-            if filter_temperature_backup_init is None:
-                htemp_backup = 2.0
-            else:
-                htemp_backup = float(filter_temperature_backup_init)
-
-            if filter_temperature_eval_sampling_init is None:
-                htemp_eval_sampling = htemp_backup
-            else:
-                htemp_eval_sampling = float(filter_temperature_eval_sampling_init)
+                assert N >= 1 and ne_samples <= 1
+            htemp_train = 1.0 if filter_temperature_train is None else float(filter_temperature_train)
+            htemp_eval = 1.0 if filter_temperature_eval is None else float(filter_temperature_eval)
 
             rng, hidden_key = jax.random.split(rng)
             hidden_def = Ensemble(filter_critic_cls, num=num_qs)
             hidden_params = hidden_def.init(hidden_key, observations, actions, time)["params"]
-            filter_critic = TrainState.create(
-                apply_fn=hidden_def.apply,
-                params=hidden_params,
-                tx=optax.adam(learning_rate=critic_lr),
-            )
+            filter_critic = TrainState.create(apply_fn=hidden_def.apply, params=hidden_params, tx=optax.adam(learning_rate=critic_lr))
             target_hidden_def = Ensemble(filter_critic_cls, num=target_filter_num_qs)
             target_filter_critic = TrainState.create(
-                apply_fn=target_hidden_def.apply,
-                params=hidden_params,
-                tx=optax.GradientTransformation(lambda _: None, lambda _: None),
+                apply_fn=target_hidden_def.apply, params=hidden_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
             )
 
         return cls(
             rng=rng,
-            update_step=jnp.asarray(0, dtype=jnp.int32),
             actor=actor,
             target_actor=target_actor,
             edit_actor=edit_actor,
@@ -687,22 +532,16 @@ class BetterDiffusionSACLearner(Agent):
             alphas=alphas,
             alpha_hats=alpha_hat,
             action_dim=action_dim,
-            clip_sampler=clip_sampler,
             T=T,
-            action_backup_soft=action_backup_soft,
             N=N,
             train_N=train_N,
             ne_samples=ne_samples,
             ne_samples_train=ne_samples_train,
             r_action_scale=r_action_scale,
             residual_action_mask=residual_action_mask,
-            batch_split=batch_split,
             M=M,
             actor_tau=actor_tau,
-            ddpm_temperature=ddpm_temperature,
-            ddim_eta_final=float(ddim_eta_final),
-            ddim_eta_hold_steps=int(ddim_eta_hold_steps),
-            ddim_eta_anneal_steps=int(ddim_eta_anneal_steps),
+            ddim_eta=float(ddim_eta),
             critic=critic,
             target_critic=target_critic,
             temp=temp,
@@ -716,43 +555,21 @@ class BetterDiffusionSACLearner(Agent):
             target_filter_critic=target_filter_critic,
             filter_enabled=filter_enabled,
             filter_at_eval=filter_at_eval,
-            filter_temperature_backup_init=htemp_backup,
-            filter_temperature_eval_sampling_init=htemp_eval_sampling,
-            filter_critic_count=filter_critic_count,
+            filter_temperature_train=htemp_train,
+            filter_temperature_eval=htemp_eval,
             filter_temperature_mode=filter_temperature_mode,
         )
 
-    def _current_ddim_eta(self):
-        if self.ddim_eta_final <= 0.0 or self.ddim_eta_anneal_steps <= 0:
-            return jnp.asarray(0.0, dtype=jnp.float32)
-        step = self.update_step.astype(jnp.float32)
-        hold = jnp.asarray(self.ddim_eta_hold_steps, dtype=jnp.float32)
-        anneal = jnp.asarray(self.ddim_eta_anneal_steps, dtype=jnp.float32)
-        frac = jnp.clip(
-            (step - hold) / anneal,
-            0.0,
-            1.0,
-        )
-        return jnp.asarray(self.ddim_eta_final, dtype=jnp.float32) * frac
-
-    def _sample_candidates(
-        self,
-        rng,
-        observations,
-        N,
-        actor_params,
-        filter_temperature,
-    ):
+    def _sample_candidates(self, rng, observations, N, actor_params, filter_temperature):
         observations = jax.device_put(jnp.asarray(observations))
         if observations.ndim == 1:
             observations = observations[None, :]
         batch_size = observations.shape[0]
 
         if not self.filter_enabled:
-            observations_repeated = jnp.broadcast_to(
-                observations[:, None, :],
-                (batch_size, N, observations.shape[-1]),
-            ).reshape(-1, observations.shape[-1])
+            observations_repeated = jnp.broadcast_to(observations[:, None, :], (batch_size, N, observations.shape[-1])).reshape(
+                -1, observations.shape[-1]
+            )
             actions_flat, rng = ddim_sampler(
                 self.actor.apply_fn,
                 actor_params,
@@ -763,10 +580,8 @@ class BetterDiffusionSACLearner(Agent):
                 self.alphas,
                 self.alpha_hats,
                 self.betas,
-                self.ddpm_temperature,
                 self.M,
-                self.clip_sampler,
-                eta=self._current_ddim_eta(),
+                eta=self.ddim_eta,
             )
             actions = actions_flat.reshape(batch_size, N, -1)
             return actions, (), rng
@@ -779,7 +594,7 @@ class BetterDiffusionSACLearner(Agent):
             hidden_apply_fn = self.target_filter_critic.apply_fn
             hidden_params = subsample_ensemble(key, self.target_filter_critic.params, self.filter_num_min_qs, self.num_qs)
 
-        actions, stored, rng = ddpm_sampler_hidden_filter(
+        actions, stored, rng = ddim_sampler_hidden_filter(
             self.actor.apply_fn,
             actor_params,
             hidden_apply_fn,
@@ -792,12 +607,10 @@ class BetterDiffusionSACLearner(Agent):
             self.alphas,
             self.alpha_hats,
             self.betas,
-            self.ddpm_temperature,
             self.M,
-            self.clip_sampler,
             filter_temperature=filter_temperature,
             filter_temperature_mode=self.filter_temperature_mode,
-            ddim_eta=self._current_ddim_eta(),
+            ddim_eta=self.ddim_eta,
             init_noise=None,
         )
         return actions, stored, rng
@@ -825,17 +638,15 @@ class BetterDiffusionSACLearner(Agent):
         batch_size = observations.shape[0]
         num_candidates = actions.shape[1]
         total_candidates = num_candidates + self.ne_samples_train
-        observations_repeated = jnp.broadcast_to(
-            observations[:, None, :],
-            (batch_size, total_candidates, observations.shape[-1]),
-        ).reshape(-1, observations.shape[-1])
+        observations_repeated = jnp.broadcast_to(observations[:, None, :], (batch_size, total_candidates, observations.shape[-1])).reshape(
+            -1, observations.shape[-1]
+        )
         actions_all = actions
 
         if self.ne_samples_train > 0:
             key, rng = jax.random.split(rng)
             r_observations = jnp.broadcast_to(
-                observations[:, None, :],
-                (batch_size, self.ne_samples_train, observations.shape[-1]),
+                observations[:, None, :], (batch_size, self.ne_samples_train, observations.shape[-1])
             ).reshape(-1, observations.shape[-1])
             d_actions = actions[:, : self.ne_samples_train].reshape(-1, actions.shape[-1])
             r_observations = jnp.concatenate([r_observations, d_actions], axis=1)
@@ -848,38 +659,12 @@ class BetterDiffusionSACLearner(Agent):
         actions_flat = actions_all.reshape(-1, actions_all.shape[-1])
         obs_flat = observations_repeated
 
-        key, rng = jax.random.split(rng)
-
-        if self.batch_split > 1:
-            assert obs_flat.shape[0] % self.batch_split == 0
-            chunk = obs_flat.shape[0] // self.batch_split
-
-            def scan_body(_, i):
-                start = i * chunk
-                obs_i = jax.lax.dynamic_slice_in_dim(obs_flat, start, chunk, axis=0)
-                actions_i = jax.lax.dynamic_slice_in_dim(actions_flat, start, chunk, axis=0)
-                q_sel_i, q_eval_i = self._outer_backup_q_scores(target_params, obs_i, actions_i)
-                return None, (q_sel_i, q_eval_i)
-
-            _, (q_sel_chunks, q_eval_chunks) = jax.lax.scan(scan_body, None, jnp.arange(self.batch_split))
-            q_sel = q_sel_chunks.reshape(-1)
-            q_eval = q_eval_chunks.reshape(-1)
-        else:
-            q_sel, q_eval = self._outer_backup_q_scores(target_params, obs_flat, actions_flat)
+        q_sel, q_eval = self._outer_backup_q_scores(target_params, obs_flat, actions_flat)
 
         q_sel = q_sel.reshape(batch_size, num_candidates + self.ne_samples_train)
         q_eval = q_eval.reshape(batch_size, num_candidates + self.ne_samples_train)
 
-        if self.action_backup_soft:
-            best_indices = sample_k_indices(
-                key,
-                q_sel,
-                1,
-                logit_scale=1.0,
-                mode="zscore",
-            ).squeeze(axis=1)
-        else:
-            best_indices = jnp.argmax(q_sel, axis=1)
+        best_indices = jnp.argmax(q_sel, axis=1)
 
         batch_indices = jnp.arange(batch_size)
         best_actions = actions_all[batch_indices, best_indices]
@@ -895,17 +680,10 @@ class BetterDiffusionSACLearner(Agent):
 
         actor_params = self.target_actor.params
         if self.filter_enabled and self.filter_at_eval:
-            actions, _, rng = self._sample_candidates(
-                rng,
-                observations,
-                self.N,
-                actor_params,
-                self.filter_temperature_eval_sampling_init,
-            )
+            actions, _, rng = self._sample_candidates(rng, observations, self.N, actor_params, self.filter_temperature_eval)
         else:
             observations_repeated = jnp.broadcast_to(
-                observations[:, None, :],
-                (observations.shape[0], self.N, observations.shape[-1]),
+                observations[:, None, :], (observations.shape[0], self.N, observations.shape[-1])
             ).reshape(-1, observations.shape[-1])
             actions, rng = ddim_sampler(
                 self.actor.apply_fn,
@@ -917,10 +695,8 @@ class BetterDiffusionSACLearner(Agent):
                 self.alphas,
                 self.alpha_hats,
                 self.betas,
-                self.ddpm_temperature,
                 self.M,
-                self.clip_sampler,
-                eta=self._current_ddim_eta(),
+                eta=self.ddim_eta,
             )
             actions = actions.reshape(1, self.N, -1)
 
@@ -930,8 +706,7 @@ class BetterDiffusionSACLearner(Agent):
             key, rng = jax.random.split(rng)
             target_params = subsample_ensemble(key, self.target_critic.params, self.num_min_qs, self.num_qs)
             obs_rep = jnp.broadcast_to(
-                observations[:, None, :],
-                (observations.shape[0], diffusion_actions.shape[0], observations.shape[-1]),
+                observations[:, None, :], (observations.shape[0], diffusion_actions.shape[0], observations.shape[-1])
             ).reshape(-1, observations.shape[-1])
             all_actions = diffusion_actions
 
@@ -939,8 +714,7 @@ class BetterDiffusionSACLearner(Agent):
                 key, rng = jax.random.split(rng)
                 d_actions = diffusion_actions[: self.ne_samples]
                 r_obs = jnp.broadcast_to(
-                    observations[:, None, :],
-                    (observations.shape[0], self.ne_samples, observations.shape[-1]),
+                    observations[:, None, :], (observations.shape[0], self.ne_samples, observations.shape[-1])
                 ).reshape(-1, observations.shape[-1])
                 r_in = jnp.concatenate([r_obs, d_actions], axis=1)
                 r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_in)
@@ -949,12 +723,7 @@ class BetterDiffusionSACLearner(Agent):
                 obs_rep = jnp.concatenate([obs_rep, r_obs], axis=0)
                 all_actions = jnp.concatenate([all_actions, r_samples], axis=0)
 
-            qs = compute_q(
-                self.target_critic.apply_fn,
-                target_params,
-                obs_rep,
-                all_actions,
-            )
+            qs = compute_q(self.target_critic.apply_fn, target_params, obs_rep, all_actions)
             idx = jnp.argmax(qs)
             action = all_actions[idx]
         else:
@@ -966,6 +735,7 @@ class BetterDiffusionSACLearner(Agent):
     def sample_actions(self, observations):
         action, rng = _sample_actions_jit(self, observations)
         return np.array(action.squeeze()), self.replace(rng=rng)
+
     @jax.jit
     def update_edit_actor(self, batch: DatasetDict):
         key, rng = jax.random.split(self.rng)
@@ -1007,7 +777,9 @@ class BetterDiffusionSACLearner(Agent):
         key, rng = jax.random.split(rng)
 
         def actor_loss_fn(score_model_params):
-            eps_pred = self.actor.apply_fn({"params": score_model_params}, batch["observations"], noisy_actions, time, rngs={"dropout": key}, training=True)
+            eps_pred = self.actor.apply_fn(
+                {"params": score_model_params}, batch["observations"], noisy_actions, time, rngs={"dropout": key}, training=True
+            )
             loss = (((eps_pred - noise_sample) ** 2).sum(axis=-1)).mean()
             return loss, {"actor_loss": loss}
 
@@ -1035,24 +807,13 @@ class BetterDiffusionSACLearner(Agent):
         key, rng = jax.random.split(rng)
         target_params = subsample_ensemble(key, self.target_critic.params, self.num_min_qs, self.num_qs)
 
-        next_actions, next_q, _, rng = self._select_best_actions(
-            rng,
-            next_obs,
-            next_actions_candidates,
-            target_params,
-        )
+        next_actions, next_q, _, rng = self._select_best_actions(rng, next_obs, next_actions_candidates, target_params)
         target_q = batch["rewards"] + self.discount * batch["masks"] * next_q
 
         key, rng = jax.random.split(rng)
 
         def critic_loss_fn(critic_params):
-            qs = self.critic.apply_fn(
-                {"params": critic_params},
-                batch["observations"],
-                batch["actions"],
-                True,
-                rngs={"dropout": key},
-            )
+            qs = self.critic.apply_fn({"params": critic_params}, batch["observations"], batch["actions"], True, rngs={"dropout": key})
             loss = ((qs - target_q) ** 2).mean()
             return loss, {"critic_loss": loss, "q": qs.mean()}
 
@@ -1065,36 +826,27 @@ class BetterDiffusionSACLearner(Agent):
         target_filter_critic = self.target_filter_critic
         if self.filter_enabled and stored and filter_critic is not None and target_filter_critic is not None:
             k_final = next_actions_candidates.shape[1]
-            obs_rep = jnp.broadcast_to(next_obs[:, None, :], (next_obs.shape[0], k_final, next_obs.shape[-1])).reshape(-1, next_obs.shape[-1])
+            obs_rep = jnp.broadcast_to(next_obs[:, None, :], (next_obs.shape[0], k_final, next_obs.shape[-1])).reshape(
+                -1, next_obs.shape[-1]
+            )
             a0_flat = next_actions_candidates.reshape(-1, next_actions_candidates.shape[-1])
-            q0 = compute_q(
-                self.target_critic.apply_fn,
-                target_params,
-                obs_rep,
-                a0_flat,
-            ).reshape(-1, k_final)
+            q0 = compute_q(self.target_critic.apply_fn, target_params, obs_rep, a0_flat).reshape(-1, k_final)
             q0 = jax.lax.stop_gradient(q0)
             rng, drop_key = jax.random.split(rng)
             num_stages = len(stored)
             stored_actions = jnp.stack(stored, axis=0)
             a_stacked = stored_actions.reshape(-1, stored_actions.shape[-1])
             q0_flat = q0.reshape(-1)
-            obs_stacked = jnp.broadcast_to(
-                obs_rep[None, :, :],
-                (num_stages, obs_rep.shape[0], obs_rep.shape[1]),
-            ).reshape(-1, obs_rep.shape[-1])
+            obs_stacked = jnp.broadcast_to(obs_rep[None, :, :], (num_stages, obs_rep.shape[0], obs_rep.shape[1])).reshape(
+                -1, obs_rep.shape[-1]
+            )
             t_stages = jnp.asarray((self.T,), dtype=jnp.int32)
             q_targets = jnp.broadcast_to(q0_flat[None, :], (num_stages, q0_flat.shape[0]))
             time_stacked = jnp.broadcast_to(t_stages[:, None, None], (num_stages, q0_flat.shape[0], 1)).reshape(-1, 1)
 
             def hidden_loss_fn(hidden_params):
                 qs = filter_critic.apply_fn(
-                    {"params": hidden_params},
-                    obs_stacked,
-                    a_stacked,
-                    time_stacked,
-                    True,
-                    rngs={"dropout": drop_key},
+                    {"params": hidden_params}, obs_stacked, a_stacked, time_stacked, True, rngs={"dropout": drop_key}
                 )
                 actual_nq = qs.shape[0]
                 qs_r = qs.reshape(actual_nq, num_stages, -1)
@@ -1113,11 +865,7 @@ class BetterDiffusionSACLearner(Agent):
             info.update(hidden_info)
 
         agent = self.replace(
-            critic=critic,
-            target_critic=target_critic,
-            filter_critic=filter_critic,
-            target_filter_critic=target_filter_critic,
-            rng=rng,
+            critic=critic, target_critic=target_critic, filter_critic=filter_critic, target_filter_critic=target_filter_critic, rng=rng
         )
         return agent, info
 
@@ -1128,11 +876,7 @@ class BetterDiffusionSACLearner(Agent):
 
         actor_params = self.actor.params
         next_actions_candidates, stored, rng = self._sample_candidates(
-            rng,
-            next_obs,
-            self.train_N,
-            actor_params,
-            self.filter_temperature_backup_init,
+            rng, next_obs, self.train_N, actor_params, self.filter_temperature_train
         )
         return self.update_critic_from_candidates(batch, next_actions_candidates, stored, rng)
 
@@ -1144,10 +888,7 @@ class BetterDiffusionSACLearner(Agent):
 
         def get_mini_batch(i):
             start = i * mini_batch_size
-            return jax.tree_util.tree_map(
-                lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0),
-                batch,
-            )
+            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), batch)
 
         actor_batch = get_mini_batch(utd_ratio - 1)
 
@@ -1172,7 +913,6 @@ class BetterDiffusionSACLearner(Agent):
             actor_info.update(edit_info)
             actor_info.update(temp_info)
         filter_noise_info = {}
-        new_agent = new_agent.replace(update_step=new_agent.update_step + 1)
         return new_agent, {**actor_info, **critic_info, **filter_noise_info}
 
     @partial(jax.jit, static_argnames="utd_ratio")
@@ -1183,10 +923,7 @@ class BetterDiffusionSACLearner(Agent):
 
         def get_mini_batch(i):
             start = i * mini_batch_size
-            return jax.tree_util.tree_map(
-                lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0),
-                batch,
-            )
+            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), batch)
 
         mini_batch_last = get_mini_batch(utd_ratio - 1)
 
@@ -1207,7 +944,6 @@ class BetterDiffusionSACLearner(Agent):
             actor_info.update(edit_info)
             actor_info.update(temp_info)
         filter_noise_info = {}
-        new_agent = new_agent.replace(update_step=new_agent.update_step + 1)
         return new_agent, {**actor_info, **critic_info, **filter_noise_info}
 
     @partial(jax.jit, static_argnames="utd_ratio")
@@ -1218,10 +954,7 @@ class BetterDiffusionSACLearner(Agent):
 
         def get_mini_batch(i):
             start = i * mini_batch_size
-            return jax.tree_util.tree_map(
-                lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0),
-                batch,
-            )
+            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), batch)
 
         mini_batch_last = get_mini_batch(utd_ratio - 1)
 
@@ -1242,14 +975,13 @@ class BetterDiffusionSACLearner(Agent):
             actor_info.update(edit_info)
             actor_info.update(temp_info)
         filter_noise_info = {}
-        new_agent = new_agent.replace(update_step=new_agent.update_step + 1)
         return new_agent, {**actor_info, **critic_info, **filter_noise_info}
 
 
 def get_config():
-    from configs import sac_config
+    from configs import base_config
 
-    config = sac_config.get_config()
+    config = base_config.get_config()
 
     config.model_cls = "BetterDiffusionSACLearner"
 
@@ -1278,25 +1010,18 @@ def get_config():
     config.N = 8
     config.train_N = 8
     config.M = 0
-    config.clip_sampler = True
-    config.ddim_eta_final = 0.0
-    config.ddim_eta_hold_steps = 0
-    config.ddim_eta_anneal_steps = 0
-    config.ddpm_temperature = 1.0
+    config.ddim_eta = 0.0
     config.beta_schedule = "vp"
 
     config.filter_enabled = True
-    config.filter_at_eval = False
-    config.filter_temperature_backup_init = 2.0
-    config.filter_temperature_eval_sampling_init = 0.0
-    config.filter_temperature_mode = "plain"
+    config.filter_at_eval = True
+    config.filter_temperature_train = 1.0
+    config.filter_temperature_eval = 0.0
+    config.filter_temperature_mode = "zscore"
 
     config.ne_samples = 1
     config.ne_samples_train = 1
-    config.r_action_scale = 0.05
-
-    config.action_backup_soft = False  # Used on q_sel values to choose actions
-    config.filter_critic_count = 1
+    config.r_action_scale = 0.15
 
     config.actor_drop = 0.0
     config.d_actor_drop = 0.0
@@ -1305,8 +1030,5 @@ def get_config():
     config.actor_tau = 0.001
     config.actor_num_blocks = 3
     config.decay_steps = int(3e6)
-    config.batch_split = 1
-    del config.target_entropy
-    del config.backup_entropy
 
     return config

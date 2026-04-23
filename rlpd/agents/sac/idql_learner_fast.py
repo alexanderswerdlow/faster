@@ -1,28 +1,25 @@
-"""Implementations of algorithms for continuous control."""
-
-import ast
 from functools import partial
 from typing import Dict, Optional, Sequence, Tuple
 
 import flax
 import flax.linen as nn
-from flax import struct
-from flax.training.train_state import TrainState
 import gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax import struct
+from flax.training.train_state import TrainState
 
 from rlpd.agents.agent import Agent
 from rlpd.data.dataset import DatasetDict
 from rlpd.networks import (
     DDPM,
+    MLP,
     DiffusionMLP,
     DiffusionMLPResNet,
     Ensemble,
     FourierFeatures,
-    MLP,
     MLPResNetV2,
     StateActionValue,
     StateValue,
@@ -65,10 +62,7 @@ def _sample_actions_jit(agent, observations):
     return action, rng
 
 
-@partial(
-    jax.jit,
-    static_argnames=("actor_apply_fn", "act_dim", "T", "repeat_last_step", "clip_sampler", "training", "use_ddim"),
-)
+@partial(jax.jit, static_argnames=("actor_apply_fn", "act_dim", "T", "repeat_last_step", "training", "use_ddim"))
 def diffusion_sampler_from_x(
     actor_apply_fn,
     actor_params,
@@ -80,9 +74,8 @@ def diffusion_sampler_from_x(
     alphas,
     alpha_hats,
     betas,
-    sample_temperature,
+    ddpm_temperature,
     repeat_last_step,
-    clip_sampler,
     training=False,
     *,
     use_ddim=False,
@@ -99,12 +92,7 @@ def diffusion_sampler_from_x(
             sqrt_alpha_hat_t = jnp.sqrt(alpha_hat_t)
             sqrt_one_minus_alpha_hat_t = jnp.sqrt(1.0 - alpha_hat_t)
             x0_pred = (current_x - sqrt_one_minus_alpha_hat_t * eps_pred) / sqrt_alpha_hat_t
-            alpha_hat_prev = jax.lax.cond(
-                time > 0,
-                lambda t: alpha_hats[t - 1],
-                lambda _: jnp.asarray(1.0, dtype=alpha_hat_t.dtype),
-                time,
-            )
+            alpha_hat_prev = jax.lax.cond(time > 0, lambda t: alpha_hats[t - 1], lambda _: jnp.asarray(1.0, dtype=alpha_hat_t.dtype), time)
             eta_ = jnp.asarray(eta, dtype=current_x.dtype)
 
             def deterministic(_):
@@ -113,7 +101,7 @@ def diffusion_sampler_from_x(
             def stochastic(_):
                 sigma = eta_ * jnp.sqrt((1.0 - alpha_hat_prev) / (1.0 - alpha_hat_t) * (1.0 - alpha_hat_t / alpha_hat_prev))
                 z = jax.random.normal(jax.random.fold_in(noise_key, time), shape=current_x.shape)
-                noise = sigma * sample_temperature * z
+                noise = sigma * z
                 eps_scale = jnp.sqrt(jnp.maximum(0.0, 1.0 - alpha_hat_prev - sigma**2))
                 return jnp.sqrt(alpha_hat_prev) * x0_pred + eps_scale * eps_pred + noise
 
@@ -123,11 +111,10 @@ def diffusion_sampler_from_x(
             alpha_2 = (1.0 - alphas[time]) / jnp.sqrt(1.0 - alpha_hats[time])
             current_x = alpha_1 * (current_x - alpha_2 * eps_pred)
             z = jax.random.normal(jax.random.fold_in(noise_key, time), shape=current_x.shape)
-            noise_scale = jnp.where(time > 0, jnp.sqrt(betas[time]) * sample_temperature, 0.0)
+            noise_scale = jnp.where(time > 0, jnp.sqrt(betas[time]) * ddpm_temperature, 0.0)
             current_x = current_x + noise_scale * z
 
-        if clip_sampler:
-            current_x = jnp.clip(current_x, -1, 1)
+        current_x = jnp.clip(current_x, -1, 1)
 
         return current_x, ()
 
@@ -208,23 +195,6 @@ class DenoisingStateActionValue(nn.Module):
         return jnp.squeeze(value, -1)
 
 
-def _maybe_literal_eval(value):
-    if isinstance(value, str):
-        return ast.literal_eval(value)
-    return value
-
-
-def _single_value(name: str, value, default, cast):
-    value = _maybe_literal_eval(value)
-    if value is None:
-        return cast(default)
-    if isinstance(value, (tuple, list)):
-        if len(value) != 1:
-            raise ValueError(f"{name} must have length 1; got {value}")
-        value = value[0]
-    return cast(value)
-
-
 class IDQLLearnerFast(Agent):
     critic: TrainState
     value: TrainState
@@ -236,24 +206,19 @@ class IDQLLearnerFast(Agent):
     alphas: jnp.ndarray
     alpha_hats: jnp.ndarray
     expectile: float
-    clip_sampler: bool = struct.field(pytree_node=False)
     action_dim: int = struct.field(pytree_node=False)
     T: int = struct.field(pytree_node=False)
     N: int = struct.field(pytree_node=False)
     train_N: int = struct.field(pytree_node=False)
-    batch_split: int = struct.field(pytree_node=False)
     M: int = struct.field(pytree_node=False)
-    ddpm_temperature: float
     actor_tau: float
     tau: float
     discount: float
-    target_entropy: float
     num_qs: int = struct.field(pytree_node=False)
     num_min_qs: Optional[int] = struct.field(pytree_node=False)
-    backup_entropy: bool = struct.field(pytree_node=False)
     filter_enabled: bool = struct.field(pytree_node=False)
     filter_at_eval: bool = struct.field(pytree_node=False)
-    filter_temperature_eval_sampling: float = struct.field(pytree_node=False)
+    filter_temperature_eval: float = struct.field(pytree_node=False)
     filter_temperature_mode: str = struct.field(pytree_node=False)
     ddim_eta: float = struct.field(pytree_node=False)
 
@@ -267,7 +232,7 @@ class IDQLLearnerFast(Agent):
         actor_lr: float = 3e-4,
         critic_lr: float = 3e-4,
         temp_lr: float = 3e-4,
-        hidden_dims: Sequence[int] = (256, 256),
+        hidden_dims: Sequence[int] = (256, 256, 256),
         discount: float = 0.99,
         tau: float = 0.005,
         num_qs: int = 2,
@@ -275,9 +240,6 @@ class IDQLLearnerFast(Agent):
         critic_dropout_rate: Optional[float] = None,
         critic_weight_decay: Optional[float] = None,
         critic_layer_norm: bool = False,
-        target_entropy: Optional[float] = None,
-        init_temperature: float = 1.0,
-        backup_entropy: bool = True,
         use_pnorm: bool = False,
         use_critic_resnet: bool = False,
         time_dim: int = 128,
@@ -288,65 +250,26 @@ class IDQLLearnerFast(Agent):
         T: int = 10,
         N: int = 32,
         train_N: int = 32,
-        batch_split: int = 1,
         M: int = 0,
         actor_layer_norm: bool = True,
-        clip_sampler: bool = True,
         decay_steps: Optional[int] = int(3e6),
         actor_tau: float = 0.001,
         actor_dropout_rate: Optional[float] = None,
         actor_num_blocks: int = 3,
-        ddpm_temperature: float = 1.0,
         beta_schedule: str = "vp",
-        deterministic_ddim_eta0: bool = True,
         ddim_eta: float = 0.0,
         filter_enabled: Optional[bool] = None,
         filter_at_eval: bool = False,
-        filter_timesteps: Optional[Sequence[int]] = None,
-        filter_keep_counts: Optional[Sequence[int]] = None,
-        filter_keep_counts_train: Optional[Sequence[int]] = None,
-        filter_temperature_eval_sampling: Optional[Sequence[float]] = None,
+        filter_temperature_eval: float = 0.0,
         filter_temperature_mode: str = "plain",
-        filter_critic_lr: Optional[float] = None,
-        filter_critic_tau: Optional[float] = None,
-        filter_critic_count: int = 1,
-        filter_critic_td: bool = False,
-        filter_critic_regression_mode: str = "sampled_policy",
-        filter_noise_actor_enabled: bool = False,
-        filter_noise_actor_steps: int = 1,
-        filter_noise_actor_q_loss: bool = True,
-        filter_noise_actor_bc_loss: bool = True,
-        filter_noise_actor_entropy_loss: bool = True,
-        filter_noise_actor_lr: Optional[float] = None,
-        filter_noise_actor_tau: Optional[float] = None,
-        filter_noise_actor_target_entropy: Optional[float] = None,
-        filter_noise_actor_temp_lr: Optional[float] = None,
-        filter_noise_actor_init_temperature: float = 1.0,
     ):
         action_dim = action_space.shape[-1]
         _validate_filter_temperature_mode(filter_temperature_mode)
         if filter_enabled is None:
             filter_enabled = bool(filter_at_eval)
 
-        filter_timestep = _single_value("filter_timesteps", filter_timesteps, T, int)
-        filter_keep_count = _single_value("filter_keep_counts", filter_keep_counts, 1, int)
-        if filter_keep_counts_train is None or len(filter_keep_counts_train) == 0:
-            filter_keep_count_train = filter_keep_count
-        else:
-            filter_keep_count_train = _single_value("filter_keep_counts_train", filter_keep_counts_train, filter_keep_count, int)
-        filter_temperature_eval_sampling = _single_value("filter_temperature_eval_sampling", filter_temperature_eval_sampling, 0.0, float)
-        assert deterministic_ddim_eta0, deterministic_ddim_eta0
-        assert filter_timestep == T, (filter_timestep, T)
-        assert filter_keep_count == 1, filter_keep_count
-        assert filter_keep_count_train == 1, filter_keep_count_train
         assert N >= 1, N
         assert train_N >= 1, train_N
-        assert filter_critic_lr is None, filter_critic_lr
-        assert filter_critic_tau is None, filter_critic_tau
-        assert filter_critic_count == 1, filter_critic_count
-        assert not filter_critic_td, filter_critic_td
-        assert filter_critic_regression_mode == "sampled_policy", filter_critic_regression_mode
-        assert not filter_noise_actor_enabled, filter_noise_actor_enabled
 
         if isinstance(action_space, gym.Space):
             observations = observation_space.sample()
@@ -355,19 +278,11 @@ class IDQLLearnerFast(Agent):
             observations = observation_space
             actions = action_space
 
-        if target_entropy is None:
-            target_entropy = -action_dim / 2
-
         rng = jax.random.PRNGKey(seed)
         rng, actor_key, critic_key, value_key, filter_key = jax.random.split(rng, 5)
 
         preprocess_time_cls = partial(FourierFeatures, output_size=time_dim, learnable=True)
-        cond_model_cls = partial(
-            DiffusionMLP,
-            hidden_dims=(time_dim * 2, time_dim * 2),
-            activations=nn.swish,
-            activate_final=False,
-        )
+        cond_model_cls = partial(DiffusionMLP, hidden_dims=(time_dim * 2, time_dim * 2), activations=nn.swish, activate_final=False)
 
         if decay_steps is not None:
             actor_lr = optax.cosine_decay_schedule(actor_lr, decay_steps)
@@ -380,25 +295,15 @@ class IDQLLearnerFast(Agent):
             out_dim=action_dim,
             activations=nn.swish,
         )
-        actor_def = DDPM(
-            time_preprocess_cls=preprocess_time_cls,
-            cond_encoder_cls=cond_model_cls,
-            reverse_encoder_cls=base_model_cls,
-        )
+        actor_def = DDPM(time_preprocess_cls=preprocess_time_cls, cond_encoder_cls=cond_model_cls, reverse_encoder_cls=base_model_cls)
 
         time = jnp.zeros((1, 1))
         observations = jnp.expand_dims(observations, axis=0)
         actions = jnp.expand_dims(actions, axis=0)
         actor_params = actor_def.init(actor_key, observations, actions, time)["params"]
-        actor = TrainState.create(
-            apply_fn=actor_def.apply,
-            params=actor_params,
-            tx=optax.adamw(learning_rate=actor_lr),
-        )
+        actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=optax.adamw(learning_rate=actor_lr))
         target_actor = TrainState.create(
-            apply_fn=actor_def.apply,
-            params=actor_params,
-            tx=optax.GradientTransformation(lambda _: None, lambda _: None),
+            apply_fn=actor_def.apply, params=actor_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
         )
 
         if beta_schedule == "cosine":
@@ -428,19 +333,13 @@ class IDQLLearnerFast(Agent):
         critic_def = Ensemble(critic_cls, num=num_qs)
         critic_params = critic_def.init(critic_key, observations, actions)["params"]
         if critic_weight_decay is not None:
-            critic_tx = optax.adamw(
-                learning_rate=critic_lr,
-                weight_decay=critic_weight_decay,
-                mask=decay_mask_fn,
-            )
+            critic_tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
         else:
             critic_tx = optax.adam(learning_rate=critic_lr)
         critic = TrainState.create(apply_fn=critic_def.apply, params=critic_params, tx=critic_tx)
         target_critic_def = Ensemble(critic_cls, num=num_min_qs or num_qs)
         target_critic = TrainState.create(
-            apply_fn=target_critic_def.apply,
-            params=critic_params,
-            tx=optax.GradientTransformation(lambda _: None, lambda _: None),
+            apply_fn=target_critic_def.apply, params=critic_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
         )
 
         value_base_cls = partial(
@@ -454,11 +353,7 @@ class IDQLLearnerFast(Agent):
         value_def = StateValue(base_cls=value_base_cls)
         value_params = value_def.init(value_key, observations)["params"]
         if critic_weight_decay is not None:
-            value_tx = optax.adamw(
-                learning_rate=critic_lr,
-                weight_decay=critic_weight_decay,
-                mask=decay_mask_fn,
-            )
+            value_tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
         else:
             value_tx = optax.adam(learning_rate=critic_lr)
         value = TrainState.create(apply_fn=value_def.apply, params=value_params, tx=value_tx)
@@ -477,18 +372,12 @@ class IDQLLearnerFast(Agent):
             filter_time = jnp.full((1, 1), T, dtype=jnp.int32)
             filter_params = filter_def.init(filter_key, observations, actions, filter_time)["params"]
             if critic_weight_decay is not None:
-                filter_tx = optax.adamw(
-                    learning_rate=critic_lr,
-                    weight_decay=critic_weight_decay,
-                    mask=decay_mask_fn,
-                )
+                filter_tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
             else:
                 filter_tx = optax.adam(learning_rate=critic_lr)
             filter_critic = TrainState.create(apply_fn=filter_def.apply, params=filter_params, tx=filter_tx)
             target_filter_critic = TrainState.create(
-                apply_fn=filter_def.apply,
-                params=filter_params,
-                tx=optax.GradientTransformation(lambda _: None, lambda _: None),
+                apply_fn=filter_def.apply, params=filter_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
             )
 
         return cls(
@@ -500,37 +389,31 @@ class IDQLLearnerFast(Agent):
             alpha_hats=alpha_hat,
             expectile=expectile,
             action_dim=action_dim,
-            clip_sampler=clip_sampler,
             T=T,
             N=N,
             train_N=train_N,
-            batch_split=batch_split,
             M=M,
             actor_tau=actor_tau,
-            ddpm_temperature=ddpm_temperature,
             value=value,
             critic=critic,
             target_critic=target_critic,
             filter_critic=filter_critic,
             target_filter_critic=target_filter_critic,
-            target_entropy=target_entropy,
             tau=tau,
             discount=discount,
             num_qs=num_qs,
             num_min_qs=num_min_qs,
-            backup_entropy=backup_entropy,
             filter_enabled=filter_enabled,
             filter_at_eval=filter_at_eval,
-            filter_temperature_eval_sampling=filter_temperature_eval_sampling,
+            filter_temperature_eval=filter_temperature_eval,
             filter_temperature_mode=filter_temperature_mode,
             ddim_eta=float(ddim_eta),
         )
 
     def _sample_diffusion_candidates(self, observations, N: int, actor_params):
-        observations_repeated = jnp.broadcast_to(
-            observations[:, None, :],
-            (observations.shape[0], N, observations.shape[-1]),
-        ).reshape(-1, observations.shape[-1])
+        observations_repeated = jnp.broadcast_to(observations[:, None, :], (observations.shape[0], N, observations.shape[-1])).reshape(
+            -1, observations.shape[-1]
+        )
         actions, rng = ddim_sampler(
             self.actor.apply_fn,
             actor_params,
@@ -541,9 +424,7 @@ class IDQLLearnerFast(Agent):
             self.alphas,
             self.alpha_hats,
             self.betas,
-            self.ddpm_temperature,
             self.M,
-            self.clip_sampler,
             eta=self.ddim_eta,
         )
         return actions.reshape(observations.shape[0], N, -1), rng
@@ -555,10 +436,7 @@ class IDQLLearnerFast(Agent):
 
     def _select_filter_candidates(self, observations, seed_actions, keep_count: int, temperature: float, rng):
         batch_size, sample_count = seed_actions.shape[:2]
-        obs_rep = jnp.broadcast_to(
-            observations[:, None, :],
-            (batch_size, sample_count, observations.shape[-1]),
-        )
+        obs_rep = jnp.broadcast_to(observations[:, None, :], (batch_size, sample_count, observations.shape[-1]))
         if keep_count >= sample_count:
             return obs_rep, seed_actions, rng
 
@@ -572,26 +450,14 @@ class IDQLLearnerFast(Agent):
             time,
         ).reshape(batch_size, sample_count)
         rng, select_key = jax.random.split(rng)
-        idx = sample_k_indices(
-            select_key,
-            filter_scores,
-            keep_count,
-            temperature=temperature,
-            mode=self.filter_temperature_mode,
-        )
+        idx = sample_k_indices(select_key, filter_scores, keep_count, temperature=temperature, mode=self.filter_temperature_mode)
         batch_idx = jnp.arange(batch_size)[:, None]
         return obs_rep[batch_idx, idx], seed_actions[batch_idx, idx], rng
 
     def _prepare_filter_critic_regression_batch(self, batch: DatasetDict, rng):
         observations = batch["observations"]
         seed_actions, rng = self._sample_filter_seed_candidates(observations, self.train_N, rng)
-        filter_observations, filter_actions, rng = self._select_filter_candidates(
-            observations,
-            seed_actions,
-            1,
-            0.0,
-            rng,
-        )
+        filter_observations, filter_actions, rng = self._select_filter_candidates(observations, seed_actions, 1, 0.0, rng)
         filter_observations = filter_observations.reshape(-1, observations.shape[-1])
         filter_actions = filter_actions.reshape(-1, self.action_dim)
         outer_critic_actions, rng = diffusion_sampler_from_x(
@@ -605,9 +471,8 @@ class IDQLLearnerFast(Agent):
             self.alphas,
             self.alpha_hats,
             self.betas,
-            self.ddpm_temperature,
+            1.0,
             self.M,
-            self.clip_sampler,
             use_ddim=True,
             eta=self.ddim_eta,
         )
@@ -623,13 +488,7 @@ class IDQLLearnerFast(Agent):
             return self._sample_diffusion_candidates(observations, N, actor_params)
 
         seed_actions, rng = self._sample_filter_seed_candidates(observations, N, self.rng)
-        obs_rep, seed_actions, rng = self._select_filter_candidates(
-            observations,
-            seed_actions,
-            1,
-            self.filter_temperature_eval_sampling,
-            rng,
-        )
+        obs_rep, seed_actions, rng = self._select_filter_candidates(observations, seed_actions, 1, self.filter_temperature_eval, rng)
         final_actions, rng = diffusion_sampler_from_x(
             self.actor.apply_fn,
             actor_params,
@@ -641,9 +500,8 @@ class IDQLLearnerFast(Agent):
             self.alphas,
             self.alpha_hats,
             self.betas,
-            self.ddpm_temperature,
+            1.0,
             self.M,
-            self.clip_sampler,
             use_ddim=True,
             eta=self.ddim_eta,
         )
@@ -674,12 +532,7 @@ class IDQLLearnerFast(Agent):
 
         def actor_loss_fn(score_model_params):
             eps_pred = self.actor.apply_fn(
-                {"params": score_model_params},
-                batch["observations"],
-                noisy_actions,
-                time,
-                rngs={"dropout": key},
-                training=True,
+                {"params": score_model_params}, batch["observations"], noisy_actions, time, rngs={"dropout": key}, training=True
             )
             actor_loss = (((eps_pred - noise_sample) ** 2).sum(axis=-1)).mean()
             return actor_loss, {"actor_loss": actor_loss}
@@ -694,11 +547,7 @@ class IDQLLearnerFast(Agent):
         rng = self.rng
         key, rng = jax.random.split(rng)
         qs = self.target_critic.apply_fn(
-            {"params": self.target_critic.params},
-            batch["observations"],
-            batch["actions"],
-            True,
-            rngs={"dropout": key},
+            {"params": self.target_critic.params}, batch["observations"], batch["actions"], True, rngs={"dropout": key}
         )
         q = qs.min(axis=0)
 
@@ -716,24 +565,13 @@ class IDQLLearnerFast(Agent):
     def update_critic(self, batch: DatasetDict) -> Tuple[TrainState, Dict[str, float]]:
         rng = self.rng
         key, rng = jax.random.split(rng)
-        next_q = self.value.apply_fn(
-            {"params": self.value.params},
-            batch["next_observations"],
-            True,
-            rngs={"dropout": key},
-        )
+        next_q = self.value.apply_fn({"params": self.value.params}, batch["next_observations"], True, rngs={"dropout": key})
         target_q = batch["rewards"] + self.discount * batch["masks"] * next_q
 
         key, rng = jax.random.split(rng)
 
         def critic_loss_fn(critic_params):
-            qs = self.critic.apply_fn(
-                {"params": critic_params},
-                batch["observations"],
-                batch["actions"],
-                True,
-                rngs={"dropout": key},
-            )
+            qs = self.critic.apply_fn({"params": critic_params}, batch["observations"], batch["actions"], True, rngs={"dropout": key})
             critic_loss = ((qs - target_q) ** 2).mean()
             return critic_loss, {"critic_loss": critic_loss, "q": qs.mean()}
 
@@ -756,28 +594,15 @@ class IDQLLearnerFast(Agent):
 
         def filter_loss_fn(filter_params):
             qs = self.filter_critic.apply_fn(
-                {"params": filter_params},
-                filter_observations,
-                filter_actions,
-                time,
-                True,
-                rngs={"dropout": drop_key},
+                {"params": filter_params}, filter_observations, filter_actions, time, True, rngs={"dropout": drop_key}
             )
             filter_loss = ((qs - q_targets) ** 2).mean()
-            info = {
-                "filter_critic_loss": filter_loss,
-                "filter_q": qs.min(axis=0).mean(),
-                "filter_target_q": q_targets.mean(),
-            }
+            info = {"filter_critic_loss": filter_loss, "filter_q": qs.min(axis=0).mean(), "filter_target_q": q_targets.mean()}
             return filter_loss, info
 
         grads, info = jax.grad(filter_loss_fn, has_aux=True)(self.filter_critic.params)
         filter_critic = self.filter_critic.apply_gradients(grads=grads)
-        target_filter_params = optax.incremental_update(
-            filter_critic.params,
-            self.target_filter_critic.params,
-            self.tau,
-        )
+        target_filter_params = optax.incremental_update(filter_critic.params, self.target_filter_critic.params, self.tau)
         target_filter_critic = self.target_filter_critic.replace(params=target_filter_params)
         return self.replace(filter_critic=filter_critic, target_filter_critic=target_filter_critic, rng=rng), info
 
@@ -836,25 +661,24 @@ class IDQLLearnerFast(Agent):
 
 
 def get_config():
-    from configs import sac_config
+    from configs import base_config
 
-    config = sac_config.get_config()
+    config = base_config.get_config()
     config.model_cls = "IDQLLearnerFast"
     config.num_qs = 2
     config.num_min_qs = 1
     config.critic_layer_norm = True
     config.expectile = 0.8
-    config.N = 32
-    config.train_N = 32
+    config.N = 8
+    config.train_N = 8
     config.actor_drop = 0.0
     config.d_actor_drop = 0.0
     config.actor_lr = 3e-4
-    config.batch_split = 1
     config.T = 10
     config.ddim_eta = 0.0
-    config.filter_enabled = False
-    config.filter_at_eval = False
-    config.filter_temperature_eval_sampling = (0.0,)
-    config.filter_temperature_mode = "plain"
+    config.filter_enabled = True
+    config.filter_at_eval = True
+    config.filter_temperature_eval = 0.0
+    config.filter_temperature_mode = "zscore"
     config.num_min_qs = 2
     return config

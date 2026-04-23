@@ -1,8 +1,7 @@
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 import flax.linen as nn
 import jax.numpy as jnp
-from flax import linen as nn
 
 ModuleDef = Any
 

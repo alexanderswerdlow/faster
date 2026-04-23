@@ -30,13 +30,7 @@ class TrajSampler:
             done = False
 
             while not done and traj_steps < self.max_traj_length:
-                action = np.asarray(
-                    policy(
-                        observation,
-                        deterministic=deterministic,
-                        add_noise=add_noise,
-                    )
-                )
+                action = np.asarray(policy(observation, deterministic=deterministic, add_noise=add_noise))
                 observation, reward, done, info = self._env.step(action)
                 info = {} if info is None else info
                 rewards.append(reward)
@@ -47,12 +41,7 @@ class TrajSampler:
             if filter and not np.sum(rewards) > 0:
                 continue
 
-            trajs.append(
-                {
-                    "rewards": np.asarray(rewards, dtype=np.float32),
-                    "steps": np.asarray(steps, dtype=np.int32),
-                }
-            )
+            trajs.append({"rewards": np.asarray(rewards, dtype=np.float32), "steps": np.asarray(steps, dtype=np.int32)})
 
         return trajs
 
@@ -62,12 +51,7 @@ class TrajSampler:
 
 
 def evaluate_robo(
-    agent,
-    env: gym.Env,
-    num_episodes: int,
-    max_traj_len: int,
-    save_video: bool = False,
-    return_trajs: bool = False,
+    agent, env: gym.Env, num_episodes: int, max_traj_len: int, save_video: bool = False, return_trajs: bool = False
 ) -> Dict[str, float]:
     sampler = TrajSampler(env, max_traj_len)
     policy = SamplerPolicy(agent)

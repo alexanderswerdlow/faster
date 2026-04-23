@@ -1,13 +1,12 @@
 import importlib.metadata
 import json
 import re
-from pathlib import Path
 import urllib.request
+from pathlib import Path
 
 import tyro
 from robomimic import DATASET_REGISTRY
 from tqdm import tqdm
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SUPPORTED_ENVS = ("lift", "can", "square", "tool_hang")
@@ -101,8 +100,7 @@ def main(
     expected_rev = _read_expected_robomimic_rev(REPO_ROOT / "pyproject.toml")
     installed_rev = _read_installed_robomimic_rev()
     assert installed_rev == expected_rev, (
-        f"Installed robomimic revision {installed_rev} does not match pyproject.toml pin {expected_rev}. "
-        "Run `uv sync` first."
+        f"Installed robomimic revision {installed_rev} does not match pyproject.toml pin {expected_rev}. Run `uv sync` first."
     )
     requested_envs = _normalize_requested(envs, SUPPORTED_ENVS, "envs")
     requested_splits = _normalize_requested(splits, SUPPORTED_SPLITS, "splits")

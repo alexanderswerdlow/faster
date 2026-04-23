@@ -88,12 +88,7 @@ def _device_put_numeric_leaves(batch):
 
 
 class RoboReplayBuffer(Dataset):
-    def __init__(
-        self,
-        example_observation,
-        example_action,
-        capacity: int,
-    ):
+    def __init__(self, example_observation, example_action, capacity: int):
         observation_data = _init_robo_replay_dict(example_observation, capacity)
         next_observation_data = _init_robo_replay_dict(example_observation, capacity)
         dataset_dict = dict(
@@ -158,11 +153,7 @@ class RoboReplayBuffer(Dataset):
 
 class ReplayBuffer(Dataset):
     def __init__(
-        self,
-        observation_space: gym.Space,
-        action_space: gym.Space,
-        capacity: int,
-        next_observation_space: Optional[gym.Space] = None,
+        self, observation_space: gym.Space, action_space: gym.Space, capacity: int, next_observation_space: Optional[gym.Space] = None
     ):
         if next_observation_space is None:
             next_observation_space = observation_space

@@ -18,9 +18,7 @@ class StateActionValue(nn.Module):
     base_cls: nn.Module
 
     @nn.compact
-    def __call__(
-        self, observations: jnp.ndarray, actions: jnp.ndarray, *args, **kwargs
-    ) -> jnp.ndarray:
+    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray, *args, **kwargs) -> jnp.ndarray:
         inputs = jnp.concatenate([observations, actions], axis=-1)
         outputs = self.base_cls()(inputs, *args, **kwargs)
 

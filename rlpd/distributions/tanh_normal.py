@@ -1,13 +1,12 @@
 import functools
 from typing import Optional, Type
 
+import flax.linen as nn
+import jax.numpy as jnp
 import tensorflow_probability
 
 from rlpd.distributions.tanh_transformed import TanhTransformedDistribution
 from rlpd.networks.mlp import default_init
-
-import flax.linen as nn
-import jax.numpy as jnp
 
 tfp = tensorflow_probability.substrates.jax
 tfd = tfp.distributions
@@ -25,23 +24,15 @@ class Normal(nn.Module):
     def __call__(self, inputs, *args, **kwargs) -> tfd.Distribution:
         x = self.base_cls()(inputs, *args, **kwargs)
 
-        means = nn.Dense(
-            self.action_dim, kernel_init=default_init(), name="OutputDenseMean"
-        )(x)
+        means = nn.Dense(self.action_dim, kernel_init=default_init(), name="OutputDenseMean")(x)
         if self.state_dependent_std:
-            log_stds = nn.Dense(
-                self.action_dim, kernel_init=default_init(), name="OutputDenseLogStd"
-            )(x)
+            log_stds = nn.Dense(self.action_dim, kernel_init=default_init(), name="OutputDenseLogStd")(x)
         else:
-            log_stds = self.param(
-                "OutpuLogStd", nn.initializers.zeros, (self.action_dim,), jnp.float32
-            )
+            log_stds = self.param("OutpuLogStd", nn.initializers.zeros, (self.action_dim,), jnp.float32)
 
         log_stds = jnp.clip(log_stds, self.log_std_min, self.log_std_max)
 
-        distribution = tfd.MultivariateNormalDiag(
-            loc=means, scale_diag=jnp.exp(log_stds)
-        )
+        distribution = tfd.MultivariateNormalDiag(loc=means, scale_diag=jnp.exp(log_stds))
 
         if self.squash_tanh:
             return TanhTransformedDistribution(distribution)
