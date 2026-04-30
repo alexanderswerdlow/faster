@@ -6,7 +6,7 @@ import numpy as np
 from flax.core import frozen_dict
 from gym.utils import seeding
 
-from rlpd.types import DataType
+from faster.types import DataType
 
 DatasetDict = Dict[str, DataType]
 

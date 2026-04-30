@@ -1,3 +1,5 @@
+"""Implementations of algorithms for continuous control."""
+
 from functools import partial
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -11,11 +13,11 @@ import optax
 from flax import struct
 from flax.training.train_state import TrainState
 
-from rlpd.agents.agent import Agent
-from rlpd.agents.sac.temperature import Temperature
-from rlpd.data.dataset import DatasetDict
-from rlpd.distributions import TanhNormal
-from rlpd.networks import (
+from faster.agents.agent import Agent
+from faster.agents.temperature import Temperature
+from faster.data.dataset import DatasetDict
+from faster.distributions import TanhNormal
+from faster.networks import (
     DDPM,
     MLP,
     DiffusionMLP,
@@ -25,8 +27,8 @@ from rlpd.networks import (
     MLPResNetV2,
     StateActionValue,
     cosine_beta_schedule,
-    ddpm_hidden_train_sampler,
     ddpm_sampler,
+    ddpm_train_sampler,
     subsample_ensemble,
     vp_beta_schedule,
 )
@@ -57,11 +59,9 @@ def sample_from_probs(key, probs):
     return jax.random.choice(key, len(probs), p=probs)
 
 
-class SAREXPOLearner(Agent):
+class EXPOLearner(Agent):
     critic: TrainState
     target_critic: TrainState
-    hidden_critic: TrainState
-    target_hidden_critic: TrainState
     target_actor: TrainState
     edit_actor: TrainState
     temp: TrainState
@@ -72,11 +72,11 @@ class SAREXPOLearner(Agent):
     action_dim: int = struct.field(pytree_node=False)
     T: int = struct.field(pytree_node=False)
     N: int = struct.field(pytree_node=False)
-    sar_N: int = struct.field(pytree_node=False)
     train_N: int = struct.field(pytree_node=False)
     ne_samples: int = struct.field(pytree_node=False)
     ne_samples_train: int = struct.field(pytree_node=False)
     r_action_scale: float = struct.field(pytree_node=False)
+    batch_split: int = struct.field(pytree_node=False)
     M: int = struct.field(pytree_node=False)
     ddpm_temperature: float
     actor_tau: float
@@ -88,6 +88,7 @@ class SAREXPOLearner(Agent):
     soft_sampling_dist: bool = struct.field(pytree_node=False)
     num_qs: int = struct.field(pytree_node=False)
     num_min_qs: Optional[int] = struct.field(pytree_node=False)  # See M in RedQ https://arxiv.org/abs/2101.05982
+    backup_entropy: bool = struct.field(pytree_node=False)
 
     @classmethod
     def create(
@@ -112,6 +113,7 @@ class SAREXPOLearner(Agent):
         target_entropy: Optional[float] = None,
         adjust_target_entropy: Optional[bool] = False,
         init_temperature: float = 1.0,
+        backup_entropy: bool = True,
         use_pnorm: bool = False,
         use_critic_resnet: bool = False,
         time_dim: int = 128,
@@ -119,8 +121,8 @@ class SAREXPOLearner(Agent):
         d_actor_drop: Optional[float] = None,
         T: int = 10,
         N: int = 32,
-        sar_N: int = 8,
         train_N: int = 32,
+        batch_split: int = 1,
         M: int = 0,
         ne_samples: int = 0,
         ne_samples_train: int = 0,
@@ -205,32 +207,6 @@ class SAREXPOLearner(Agent):
         edit_actor = TrainState.create(apply_fn=edit_actor_def.apply, params=edit_actor_params, tx=optax.adam(learning_rate=actor_lr))
 
         if use_critic_resnet:
-            hidden_critic_base_cls = partial(MLPResNetV2, num_blocks=1)
-        else:
-            hidden_critic_base_cls = partial(
-                MLP,
-                hidden_dims=hidden_dims,
-                activate_final=True,
-                dropout_rate=critic_dropout_rate,
-                use_layer_norm=critic_layer_norm,
-                use_pnorm=use_pnorm,
-            )
-        hidden_critic_cls = partial(StateActionValue, base_cls=hidden_critic_base_cls)
-        hidden_critic_def = Ensemble(hidden_critic_cls, num=num_qs)
-        hidden_critic_params = hidden_critic_def.init(critic_key, observations, actions)["params"]
-        if critic_weight_decay is not None:
-            tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
-        else:
-            tx = optax.adam(learning_rate=critic_lr)
-        hidden_critic = TrainState.create(apply_fn=hidden_critic_def.apply, params=hidden_critic_params, tx=tx)
-        target_hidden_critic_def = Ensemble(hidden_critic_cls, num=num_min_qs or num_qs)
-        target_hidden_critic = TrainState.create(
-            apply_fn=target_hidden_critic_def.apply,
-            params=hidden_critic_params,
-            tx=optax.GradientTransformation(lambda _: None, lambda _: None),
-        )
-
-        if use_critic_resnet:
             critic_base_cls = partial(MLPResNetV2, num_blocks=1)
         else:
             critic_base_cls = partial(
@@ -274,23 +250,22 @@ class SAREXPOLearner(Agent):
             soft_sampling_beta=soft_sampling_beta,
             N=N,
             train_N=train_N,
-            sar_N=sar_N,
             ne_samples=ne_samples,
             ne_samples_train=ne_samples_train,
             r_action_scale=r_action_scale,
+            batch_split=batch_split,
             M=M,
             actor_tau=actor_tau,
             ddpm_temperature=ddpm_temperature,
             critic=critic,
             target_critic=target_critic,
-            hidden_critic=hidden_critic,
-            target_hidden_critic=target_hidden_critic,
             temp=temp,
             target_entropy=target_entropy,
             tau=tau,
             discount=discount,
             num_qs=num_qs,
             num_min_qs=num_min_qs,
+            backup_entropy=backup_entropy,
         )
 
     def eval_actions(self, observations):
@@ -366,14 +341,9 @@ class SAREXPOLearner(Agent):
         observations_repeated = jnp.repeat(observations, self.train_N, axis=0)
 
         actor_params = self.actor.params
-        key, rng = jax.random.split(rng, 2)
-        hidden_params = subsample_ensemble(key, self.hidden_critic.params, self.num_min_qs, self.num_qs)
-
-        actions_flat, rng, filtered_first_step, filtered_critic_values = ddpm_hidden_train_sampler(
+        actions_flat, rng = ddpm_train_sampler(
             self.actor.apply_fn,
             actor_params,
-            self.target_hidden_critic.apply_fn,
-            hidden_params,
             self.T,
             rng,
             self.action_dim,
@@ -384,16 +354,12 @@ class SAREXPOLearner(Agent):
             self.ddpm_temperature,
             self.M,
             self.clip_sampler,
-            self.train_N,
-            self.sar_N,
         )
 
         # Reshape actions from (batch_size * N, action_dim) to (batch_size, N, action_dim)
-        actions = actions_flat.reshape(batch_size, self.sar_N, -1)
-        sar_actions = actions
-        filtered_first_step = filtered_first_step.reshape(batch_size, self.sar_N, -1)
+        actions = actions_flat.reshape(batch_size, self.train_N, -1)
 
-        observations_repeated = jnp.repeat(observations, self.sar_N + self.ne_samples_train, axis=0)
+        observations_repeated = jnp.repeat(observations, self.train_N + self.ne_samples_train, axis=0)
 
         if self.ne_samples_train > 0:
             key, rng = jax.random.split(rng, 2)
@@ -422,10 +388,26 @@ class SAREXPOLearner(Agent):
 
             # Compute Q-values: (batch_size * N,)
 
-            qs = compute_q(self.target_critic.apply_fn, target_params, obs_flat, actions_flat)
+            if self.batch_split > 1:
+                q_list = []
+
+                one_call = (batch_size * (self.train_N + self.ne_samples_train)) // self.batch_split
+
+                for i in range(self.batch_split):
+                    obs_i = obs_flat[i * one_call : (i + 1) * one_call]
+                    actions_i = actions_flat[i * one_call : (i + 1) * one_call]
+
+                    q_list += [compute_q(self.target_critic.apply_fn, target_params, obs_i, actions_i)]
+
+                    # qs[i * self.train_N : (i + 1) * self.train_N] = compute_q(self.target_critic.apply_fn, target_params, obs_i, actions_i)
+
+                qs = jnp.concatenate(q_list)
+
+            else:
+                qs = compute_q(self.target_critic.apply_fn, target_params, obs_flat, actions_flat)
 
             # Reshape Q-values: (batch_size, N)
-            qs = qs.reshape(batch_size, self.sar_N + self.ne_samples_train)
+            qs = qs.reshape(batch_size, self.train_N + self.ne_samples_train)
 
             if self.soft_sampling_dist_backup:
                 soft_qs = jax.nn.softmax(self.soft_sampling_beta * qs, axis=1)
@@ -446,7 +428,7 @@ class SAREXPOLearner(Agent):
             best_actions = actions[:, 0]  # (batch_size, action_dim)
 
         rng, _ = jax.random.split(rng, 2)
-        return jnp.array(best_actions.squeeze()), sar_actions, filtered_first_step
+        return jnp.array(best_actions.squeeze())
 
     def sample_actions(self, observations):
         rng = self.rng
@@ -587,7 +569,7 @@ class SAREXPOLearner(Agent):
         return self.replace(temp=temp), temp_info
 
     def update_critic(self, batch: DatasetDict) -> Tuple[TrainState, Dict[str, float]]:
-        next_actions, sar_actions, filtered_first_step = self.sample_batch_actions(batch["next_observations"])
+        next_actions = self.sample_batch_actions(batch["next_observations"])
 
         rng = self.rng
 
@@ -617,85 +599,51 @@ class SAREXPOLearner(Agent):
         target_critic_params = optax.incremental_update(critic.params, self.target_critic.params, self.tau)
         target_critic = self.target_critic.replace(params=target_critic_params)
 
-        next_observations = jnp.repeat(batch["next_observations"], self.sar_N, axis=0)
-        sar_actions = sar_actions.reshape(-1, sar_actions.shape[-1])
-        filtered_first_step = filtered_first_step.reshape(-1, filtered_first_step.shape[-1])
-
-        qs = critic.apply_fn({"params": critic.params}, next_observations, sar_actions, True, rngs={"dropout": key})  # training=True
-
-        def hidden_critic_loss_fn(hidden_critic_params) -> Tuple[jnp.ndarray, Dict[str, float]]:
-            hidden_qs = self.hidden_critic.apply_fn(
-                {"params": hidden_critic_params}, next_observations, filtered_first_step, True, rngs={"dropout": key}
-            )  # training=True
-            hidden_critic_loss = ((hidden_qs - qs) ** 2).mean()
-            return hidden_critic_loss, {"hidden_critic_loss": hidden_critic_loss, "hidden_q": hidden_qs.mean()}
-
-        grads, info = jax.grad(hidden_critic_loss_fn, has_aux=True)(self.hidden_critic.params)
-        hidden_critic = self.hidden_critic.apply_gradients(grads=grads)
-
-        target_hidden_critic_params = optax.incremental_update(hidden_critic.params, self.target_hidden_critic.params, self.tau)
-        target_hidden_critic = self.target_hidden_critic.replace(params=target_hidden_critic_params)
-
-        return (
-            self.replace(
-                critic=critic, target_critic=target_critic, hidden_critic=hidden_critic, target_hidden_critic=target_hidden_critic, rng=rng
-            ),
-            info,
-            sar_actions,
-            filtered_first_step,
-        )
+        return self.replace(critic=critic, target_critic=target_critic, rng=rng), info
 
     @partial(jax.jit, static_argnames=("utd_ratio", "pretrain_q", "pretrain_r"))
     def update_offline(self, batch: DatasetDict, utd_ratio: int, pretrain_q: bool, pretrain_r: bool):
-        def reshape_batch(x):
-            assert x.shape[0] % utd_ratio == 0
-            batch_size = x.shape[0] // utd_ratio
-            return x.reshape((utd_ratio, batch_size, *x.shape[1:]))
-
-        mini_batches = jax.tree_util.tree_map(reshape_batch, batch)
-        last_mini_batch = jax.tree_util.tree_map(lambda x: x[-1], mini_batches)
-
         new_agent = self
-        critic_info = {}
-        if pretrain_q:
+        for i in range(utd_ratio):
 
-            def critic_step(agent, mini_batch):
-                agent, critic_info, _, _ = agent.update_critic(mini_batch)
-                return agent, critic_info
+            def slice(x):
+                assert x.shape[0] % utd_ratio == 0
+                batch_size = x.shape[0] // utd_ratio
+                return x[batch_size * i : batch_size * (i + 1)]
 
-            new_agent, critic_infos = jax.lax.scan(critic_step, new_agent, mini_batches)
-            critic_info = jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
+            mini_batch = jax.tree_util.tree_map(slice, batch)
+            critic_info = {}
+            if pretrain_q:
+                new_agent, critic_info = new_agent.update_critic(mini_batch)
 
-        new_agent, actor_info = new_agent.update_actor(last_mini_batch)
+        new_agent, actor_info = new_agent.update_actor(mini_batch)
 
-        if pretrain_r and (self.ne_samples + self.ne_samples_train > 0):
-            new_agent, actor_info = new_agent.update_edit_actor(last_mini_batch)
-            new_agent, temp_info = new_agent.update_temperature(actor_info["entropy"])
-            actor_info.update(temp_info)
+        if pretrain_r:
+            if self.ne_samples + self.ne_samples_train > 0:
+                new_agent, actor_info = new_agent.update_edit_actor(mini_batch)
+                new_agent, temp_info = new_agent.update_temperature(actor_info["entropy"])
+
+                actor_info.update(temp_info)
 
         return new_agent, {**actor_info, **critic_info}
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update_separate(self, batch: DatasetDict, actor_batch: DatasetDict, utd_ratio: int):
-        def reshape_batch(x):
-            assert x.shape[0] % utd_ratio == 0
-            batch_size = x.shape[0] // utd_ratio
-            return x.reshape((utd_ratio, batch_size, *x.shape[1:]))
+        new_agent = self
+        for i in range(utd_ratio):
 
-        mini_batches = jax.tree_util.tree_map(reshape_batch, batch)
-        last_mini_batch = jax.tree_util.tree_map(lambda x: x[-1], mini_batches)
+            def slice(x):
+                assert x.shape[0] % utd_ratio == 0
+                batch_size = x.shape[0] // utd_ratio
+                return x[batch_size * i : batch_size * (i + 1)]
 
-        def critic_step(agent, mini_batch):
-            agent, critic_info = agent.update_critic(mini_batch)
-            return agent, critic_info
-
-        new_agent, critic_infos = jax.lax.scan(critic_step, self, mini_batches)
-        critic_info = jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
+            mini_batch = jax.tree_util.tree_map(slice, batch)
+            new_agent, critic_info = new_agent.update_critic(mini_batch)
 
         new_agent, actor_info = new_agent.update_actor(actor_batch)
 
         if self.ne_samples + self.ne_samples_train > 0:
-            new_agent, actor_info = new_agent.update_edit_actor(last_mini_batch)
+            new_agent, actor_info = new_agent.update_edit_actor(mini_batch)
             new_agent, temp_info = new_agent.update_temperature(actor_info["entropy"])
 
             actor_info.update(temp_info)
@@ -704,25 +652,21 @@ class SAREXPOLearner(Agent):
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update(self, batch: DatasetDict, utd_ratio: int):
-        def reshape_batch(x):
-            assert x.shape[0] % utd_ratio == 0
-            batch_size = x.shape[0] // utd_ratio
-            return x.reshape((utd_ratio, batch_size, *x.shape[1:]))
+        new_agent = self
+        for i in range(utd_ratio):
 
-        mini_batches = jax.tree_util.tree_map(reshape_batch, batch)
-        last_mini_batch = jax.tree_util.tree_map(lambda x: x[-1], mini_batches)
+            def slice(x):
+                assert x.shape[0] % utd_ratio == 0
+                batch_size = x.shape[0] // utd_ratio
+                return x[batch_size * i : batch_size * (i + 1)]
 
-        def critic_step(agent, mini_batch):
-            agent, critic_info, sar_actions, filtered_first_step = agent.update_critic(mini_batch)
-            return agent, critic_info
+            mini_batch = jax.tree_util.tree_map(slice, batch)
+            new_agent, critic_info = new_agent.update_critic(mini_batch)
 
-        new_agent, critic_infos = jax.lax.scan(critic_step, self, mini_batches)
-        critic_info = jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
-
-        new_agent, actor_info = new_agent.update_actor(last_mini_batch)
+        new_agent, actor_info = new_agent.update_actor(mini_batch)
 
         if self.ne_samples + self.ne_samples_train > 0:
-            new_agent, actor_info = new_agent.update_edit_actor(last_mini_batch)
+            new_agent, actor_info = new_agent.update_edit_actor(mini_batch)
             new_agent, temp_info = new_agent.update_temperature(actor_info["entropy"])
 
             actor_info.update(temp_info)
@@ -731,19 +675,18 @@ class SAREXPOLearner(Agent):
 
 
 def get_config():
-    from ml_collections.config_dict import config_dict
-
     from configs import base_config
 
     config = base_config.get_config()
-    config.model_cls = "SAREXPOLearner"
+    config.model_cls = "EXPOLearner"
+
     config.num_qs = 10
     config.num_min_qs = 2
     config.critic_layer_norm = True
+
     config.N = 32
     config.train_N = 32
-    config.sar_N = 8
-    config.target_entropy = config_dict.placeholder(float)
+    config.target_entropy = None
     config.ne_samples = 0
     config.ne_samples_train = 0
     config.adjust_target_entropy = False
@@ -754,5 +697,14 @@ def get_config():
     config.actor_drop = 0.0
     config.d_actor_drop = 0.0
     config.actor_lr = 3e-4
+    config.batch_split = 1
     config.T = 10
+
+    config.backup_entropy = False
+    config.hidden_dims = (256, 256, 256)
+    config.num_min_qs = 2
+    config.N = 8
+    config.train_N = 8
+    config.r_action_scale = 0.15
+
     return config

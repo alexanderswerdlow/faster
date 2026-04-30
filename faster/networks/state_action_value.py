@@ -1,7 +1,7 @@
 import flax.linen as nn
 import jax.numpy as jnp
 
-from rlpd.networks.mlp import default_init
+from faster.networks.mlp import default_init
 
 
 class StateValue(nn.Module):

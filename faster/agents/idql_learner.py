@@ -11,9 +11,9 @@ import optax
 from flax import struct
 from flax.training.train_state import TrainState
 
-from rlpd.agents.agent import Agent
-from rlpd.data.dataset import DatasetDict
-from rlpd.networks import (
+from faster.agents.agent import Agent
+from faster.data.dataset import DatasetDict
+from faster.networks import (
     DDPM,
     MLP,
     DiffusionMLP,

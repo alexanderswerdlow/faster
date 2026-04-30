@@ -2,6 +2,6 @@
 
 source .env && python train_robo.py \
   --dataset_dir=ph \
-  --config.model_cls=BetterDiffusionSACLearner \
+  --config.model_cls=FasterEXPOLearner \
   --env_name=lift \
   --num_data=10 $@

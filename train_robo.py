@@ -15,12 +15,12 @@ from flax.training import checkpoints
 from ml_collections import config_flags
 
 import wandb
-from rlpd.agents import BetterDiffusionSACLearner, IDQLLearner, IDQLLearnerFast, SAREXPOLearner
-from rlpd.data import RoboReplayBuffer
-from rlpd.data.robomimic_datasets import ENV_TO_HORIZON_MAP, RoboD4RLDataset, get_robomimic_env
-from rlpd.param_utils import print_agent_param_summary
-from rlpd.train_robo_env_utils import _resolve_robomimic_dataset_path
-from rlpd.utils import (
+from faster.agents import EXPOLearner, FasterEXPOLearner, FasterIDQLLearner, IDQLLearner
+from faster.data import RoboReplayBuffer
+from faster.data.robomimic_datasets import ENV_TO_HORIZON_MAP, RoboD4RLDataset, get_robomimic_env
+from faster.param_utils import print_agent_param_summary
+from faster.train_robo_env_utils import _resolve_robomimic_dataset_path
+from faster.utils import (
     CsvLogger,
     _build_gitignore_exclude_fn,
     _build_source_code_include_fn,
@@ -36,10 +36,10 @@ from rlpd.utils import (
 FLAGS = flags.FLAGS
 FLAGS.set_default("log_dir", "exp")
 MODEL_REGISTRY = {
-    "BetterDiffusionSACLearner": BetterDiffusionSACLearner,
-    "SAREXPOLearner": SAREXPOLearner,
+    "EXPOLearner": EXPOLearner,
     "IDQLLearner": IDQLLearner,
-    "IDQLLearnerFast": IDQLLearnerFast,
+    "FasterIDQLLearner": FasterIDQLLearner,
+    "FasterEXPOLearner": FasterEXPOLearner,
 }
 
 flags.DEFINE_string("project_name", "sample_rank", "wandb project name.")
@@ -71,7 +71,7 @@ flags.DEFINE_boolean("binary_include_bc", True, "Whether to include BC data in t
 flags.DEFINE_boolean("pretrain_r", True, "Whether to include BC data in the binary datasets.")
 flags.DEFINE_boolean("pretrain_q", True, "Whether to include BC data in the binary datasets.")
 config_flags.DEFINE_config_file(
-    "config", "rlpd/agents/sac/sar_better_agent.py", "File path to the training hyperparameter configuration.", lock_config=False
+    "config", "faster/agents/faster_expo_learner.py", "File path to the training hyperparameter configuration.", lock_config=False
 )
 
 

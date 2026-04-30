@@ -12,11 +12,11 @@ from flax import struct
 from flax.training.train_state import TrainState
 from ml_collections import config_dict
 
-from rlpd.agents.agent import Agent
-from rlpd.agents.sac.temperature import Temperature
-from rlpd.data.dataset import DatasetDict
-from rlpd.distributions import TanhNormal
-from rlpd.networks import (
+from faster.agents.agent import Agent
+from faster.agents.temperature import Temperature
+from faster.data.dataset import DatasetDict
+from faster.distributions import TanhNormal
+from faster.networks import (
     DDPM,
     MLP,
     DiffusionMLP,
@@ -298,7 +298,7 @@ def ddim_sampler_hidden_filter(
     return x, stored, rng
 
 
-class BetterDiffusionSACLearner(Agent):
+class FasterEXPOLearner(Agent):
     critic: TrainState
     target_critic: TrainState
     actor: TrainState
@@ -983,7 +983,7 @@ def get_config():
 
     config = base_config.get_config()
 
-    config.model_cls = "BetterDiffusionSACLearner"
+    config.model_cls = "FasterEXPOLearner"
 
     config.critic_lr = 3e-4
     config.temp_lr = 3e-4

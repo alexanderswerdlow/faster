@@ -123,7 +123,7 @@ FILTERS
 
 INCLUDE_ROOTS=(
   "configs"
-  "rlpd"
+  "faster"
   "scripts"
   "assets"
 )

@@ -6,7 +6,7 @@ import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
 from robomimic.config import config_factory
 
-from rlpd.data.dataset import Dataset
+from faster.data.dataset import Dataset
 
 OBS_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos", "object")
 ENV_TO_HORIZON_MAP = {"lift": 400, "can": 400, "square": 400, "transport": 700, "tool_hang": 700}

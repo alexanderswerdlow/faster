@@ -2,8 +2,8 @@
 
 source .env && python train_robo.py \
   --env_name=can \
-  --config=rlpd/agents/sac/idql_learner_fast.py \
-  --config.model_cls=IDQLLearnerFast \
+  --config=faster/agents/faster_idql_learner.py \
+  --config.model_cls=FasterIDQLLearner \
   --config.T=100 \
   --start_training=10000 \
   --config.filter_temperature_eval=10.0 \

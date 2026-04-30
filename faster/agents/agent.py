@@ -5,7 +5,7 @@ import numpy as np
 from flax import struct
 from flax.training.train_state import TrainState
 
-from rlpd.types import PRNGKey
+from faster.types import PRNGKey
 
 
 @partial(jax.jit, static_argnames="apply_fn")

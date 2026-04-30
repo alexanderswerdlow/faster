@@ -5,8 +5,8 @@ import flax.linen as nn
 import jax.numpy as jnp
 import tensorflow_probability
 
-from rlpd.distributions.tanh_transformed import TanhTransformedDistribution
-from rlpd.networks.mlp import default_init
+from faster.distributions.tanh_transformed import TanhTransformedDistribution
+from faster.networks.mlp import default_init
 
 tfp = tensorflow_probability.substrates.jax
 tfd = tfp.distributions

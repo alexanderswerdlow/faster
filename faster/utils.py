@@ -6,8 +6,8 @@ import numpy as np
 from robomimic.utils.dataset import SequenceDataset
 
 import wandb
-from rlpd.data.robomimic_datasets import OBS_KEYS, process_robomimic_dataset
-from rlpd.evaluation import evaluate_robo
+from faster.data.robomimic_datasets import OBS_KEYS, process_robomimic_dataset
+from faster.evaluation import evaluate_robo
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -88,7 +88,7 @@ def _build_gitignore_exclude_fn(repo_root):
     return exclude_fn
 
 
-_SOURCE_CODE_INCLUDE_ROOTS = ("rlpd", "configs")
+_SOURCE_CODE_INCLUDE_ROOTS = ("faster", "configs")
 
 
 def _batch_size(tree):

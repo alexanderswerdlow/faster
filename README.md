@@ -42,7 +42,7 @@ The code expects the Robomimic low-dim datasets `low_dim_v141.hdf5` in `$ROBOMIM
 ```bash
 source .env && WANDB_MODE=offline python train_robo.py \
   --dataset_dir=ph \
-  --config.model_cls=BetterDiffusionSACLearner \
+  --config.model_cls=FasterEXPOLearner \
   --log_dir=exp \
   --env_name=can \
   --eval_interval=1 \

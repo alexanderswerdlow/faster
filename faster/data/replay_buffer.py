@@ -7,7 +7,7 @@ import jax
 import numpy as np
 from flax.core import frozen_dict
 
-from rlpd.data.dataset import Dataset, DatasetDict
+from faster.data.dataset import Dataset, DatasetDict
 
 
 def _init_replay_dict(obs_space: gym.Space, capacity: int) -> Union[np.ndarray, DatasetDict]:
